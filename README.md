@@ -4,6 +4,124 @@ Cliente de consola refactorizado a partir de `cliente_powerbi.py`, con Python 3.
 y exclusivamente su biblioteca estándar. No utiliza Node.js, npm, pip ni servicios
 de IA para funcionar. Necesita el servidor MCP de Microsoft instalado por separado.
 
+## Versión actual: --write sin confirmaciones y reconexión segura
+
+Para actualizar otra laptop basta con reemplazar **cliente.py** por la versión
+actual de la rama main. Es un único archivo y solo utiliza la biblioteca estándar.
+Conserva la detección original del ejecutable en `Path.home() / '.vscode' / 'extensions'`;
+no contiene la ruta personal, el puerto ni los nombres del modelo de este equipo.
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python cliente.py --write
+```
+
+Flujo: seleccionar el modelo, elegir 13, pegar JSON y terminar con FIN. El bloque
+se valida completo, imprime un resumen y se ejecuta automáticamente. No solicita
+EDITAR al inicio, CONFIRMAR, s/N, selección de detalle ni Enter para volver al menú
+después de la opción 13. `--debug` muestra el detalle completo sin preguntar.
+Sin --write, las escrituras siguen bloqueadas y los bloques de consultas DAX
+pueden ejecutarse en modo lectura. Las validaciones de objetos, dependencias,
+esquemas, errores semánticos, respaldo, transacciones y recuperación se conservan.
+Los formularios de las opciones 4 a 9 conservan sus flujos anteriores.
+
+El consentimiento booleano de escritura del servidor puede ser autorizado por
+--write durante el bloque validado. Una solicitud desconocida, de credenciales o
+de licencia se rechaza sin abrir preguntas: --write no acepta licencias nuevas
+ni proporciona información adicional. El servidor puede rechazar una operación
+por permisos o políticas y ese rechazo sigue siendo un error.
+
+### Identidad y reconexión
+
+La comparación anterior exigía igualdad del título de la ventana y de valores
+sin normalizar de proceso/hora. Un cambio de título o representaciones distintas
+del mismo PID/fecha podían rechazar una conexión válida. Además, se borraba el
+destino seleccionado al perder la conexión y se comparaba el alias MCP como si
+fuera la identidad del modelo. Son defectos identificados y reproducidos en las
+pruebas; sin el registro de la otra laptop no se puede afirmar cuál fue su causa
+exacta.
+
+Ahora se separan:
+
+- **Destino:** puerto local, proceso y hora de inicio normalizada, más la identidad
+  de base de datos devuelta por GetConnection. El título es informativo y no se
+  usa para cambiar de modelo automáticamente.
+- **Conexión:** alias devuelto por Connect, que puede cambiar al reconectar.
+- **Sesión:** identidad de la sesión del motor y del proceso MCP; un transactionId
+  no se reutiliza ciegamente en otro proceso.
+
+Ante una conexión perdida se conserva la intención de destino. Se descubre la
+misma instancia y se comprueba la misma base de datos antes de volver a escribir.
+No se cambia de puerto, no se busca otra instancia por el mismo título y se rechaza
+una base distinta aunque coincidan alias o nombre de ventana. Si no hay datos
+suficientes para probar la identidad, el bloque se detiene con un diagnóstico.
+
+Si el proceso MCP murió, el cliente puede iniciar otro con el mismo ejecutable y
+modo, redescubrir herramientas y reconectar al destino verificado. Dentro de una
+transacción no se continúa escribiendo sobre una nueva sesión: se detiene el
+bloque y se intenta recuperar, comprobando el estado desde la sesión nueva cuando
+se confirmó que el proceso anterior terminó.
+
+Una escritura enviada con respuesta incierta **nunca se repite automáticamente**.
+Se consulta el estado y se aplica el procedimiento de recuperación. Los respaldos
+incluyen `targetIdentity`, sesión MCP y `connectionDiagnostics` con motivos de
+rechazo/reconexión. Si el fallo sucede antes de enviar escrituras, se informa que
+no hay cambios del bloque que deshacer, distinguiéndolo de una recuperación fallida.
+Una transacción anterior sin cierre confirmado impide iniciar otro bloque.
+
+### Pruebas de esta corrección
+
+Pasaron **119 pruebas automatizadas**. Entre las nuevas: flujo real de main sin
+EDITAR, ninguna pregunta después de FIN, escritura deshabilitada sin --write,
+título cambiado, PID/puerto como texto, fechas UTC equivalentes, fecha opcional
+ausente, proceso/puerto/base distintos, pérdida de alias, sesión cambiada durante
+transacción, respuesta perdida después de escribir, autorización booleana del
+servidor y rechazo de solicitudes desconocidas.
+
+Pruebas reales con el ejecutable de VS Code y el modelo abierto:
+
+| Caso | Resultado |
+| --- | --- |
+| Bloque de 20 operaciones | Creaciones, modificaciones y eliminaciones; solo JSON y FIN |
+| Título y formatos de descubrimiento modificados por el ensayo | Misma instancia real aceptada, sin confundir formato con cambio de modelo |
+| Disconnect real de la conexión MCP | Reconexión al mismo destino y bloque completado |
+| Proceso MCP terminado antes de un bloque | Nuevo proceso, mismo modelo verificado y bloque completado |
+| Respuesta perdida tras una creación aplicada | Una sola creación enviada; recuperación verificada |
+| Proceso terminado tras escritura sin transacción global | Reinicio, lectura del estado y compensación verificada |
+| Proceso terminado dentro de una transacción | Recuperación en una sesión nueva; sin reutilizar la transacción anterior |
+| DAX intencionalmente inválido | Bloque fallido y recuperación verificada |
+| Otra instancia mediante datos inyectados | Rechazada; ninguna escritura a otro modelo |
+| Limpieza desde un lector MCP nuevo | Ausencia de los objetos de prueba verificada |
+
+La pérdida de respuesta se inyecta **después** de enviar y aplicar la escritura
+real; no se simula la escritura. La terminación del proceso MCP y Disconnect son
+reales. Los cambios de formato/título y el destino alternativo son datos inyectados,
+indicados como tales; no se afirma haber cambiado físicamente a otro modelo.
+Se renovó la sesión del lector independiente antes de comprobar la limpieza,
+porque el servidor puede mantener metadatos en caché de una conexión anterior.
+
+```powershell
+python -m unittest discover -s tests -v
+# Solo en un modelo autorizado para pruebas destructivas:
+python tests/live_auto_connection.py --modelo "Titulo del modelo" --confirmar-escrituras
+```
+
+El informe real se guarda en `resultado_automatico_conexion.json`. Para investigar
+un rechazo en otro equipo, utiliza --debug y conserva el error específico y el
+respaldo con connectionDiagnostics. No se garantiza recuperación si la instancia
+original desapareció, cambió su base de datos o no puede volver a verificarse.
+La copia completa del PBIP/PBIX, los visuales y el guardado/reapertura del proyecto
+siguen fuera del alcance de este respaldo de objetos.
+
+Archivos de actualización:
+
+- Obligatorio para ejecutar: **cliente.py**.
+- Si usas transferencia codificada: **codigo.txt**, regenerado, o vuelve a ejecutar
+  codificar.py. Los scripts codificar.py/decodificar.py no cambiaron.
+- Para documentación y pruebas: README.md y tests/ del paquete actualizado.
+- No copies backups/ del modelo de prueba a la otra laptop como configuración.
+
+
 ## Inicio rápido en Windows 11
 
 1. Extrae todos los archivos en una carpeta autorizada.
@@ -30,8 +148,8 @@ Para edición:
 python cliente.py --write
 ```
 
-El programa pide `EDITAR` al iniciar. Guarda una copia del PBIX. Cada lote muestra
-la vista previa y requiere escribir exactamente `CONFIRMAR`. Los formularios de las opciones 4 a 9 envían los objetos
+Con --write no se pide EDITAR al iniciar. Guarda una copia del PBIX. La opción 13
+valida y ejecuta sin confirmaciones; los formularios 4 a 9 mantienen su confirmación. Los formularios de las opciones 4 a 9 envían los objetos
 individualmente; la opción 13 incorpora la protección descrita más abajo. Se informa el resultado
 individual y se conservan los cambios que ya fueron confirmados si otro falla.
 El servidor puede solicitar además su propio consentimiento.
@@ -82,7 +200,7 @@ la selección del menú y obliga a elegir nuevamente el modelo.
 
 ## Respaldo y recuperación de bloques (opción 13)
 
-La opción 13 conserva el orden y la confirmación única, y ahora respalda el estado
+La opción 13 conserva el orden y ahora usa --write como autorización, respalda el estado
 previo y comprueba la recuperación cuando falla el bloque. Las opciones 1 a 12
 siguen disponibles; los formularios 4 a 9 y el modo avanzado conservan su
 funcionamiento anterior. El diario y la recuperación global descritos aquí
@@ -199,7 +317,7 @@ medidas pendientes de Commit; y fórmulas inválidas guardadas como SemanticErro
 También se separó el estado final del bloque de los contadores individuales para
 que un fallo de Commit no aparezca como éxito global.
 
-Pasaron **98 pruebas automatizadas**: las anteriores más casos de respaldo,
+La versión anterior de recuperación pasó **98 pruebas automatizadas**, incluidas actualmente en las 119: casos de respaldo,
 transacción, compensación, errores de guardado, cierre/confirmación fallidos,
 recuperación incompleta, inferencia de tipo y errores semánticos. Los casos de
 disco lleno o servidor inaccesible son simulados; no se afirma haber provocado
@@ -231,16 +349,14 @@ para transferir el cliente actualizado.
 La IA solo prepara el JSON. El cliente no llama a ChatGPT, Codex ni a otro servicio
 para ejecutar el bloque. Se mantienen las opciones 1 a 12 y su transporte MCP.
 
-1. Inicia con `python cliente.py --write` si habrá cambios; escribe `EDITAR`.
+1. Inicia con `python cliente.py --write` si habrá cambios.
 2. Selecciona el modelo por número. Ese será el único destino del bloque.
 3. Selecciona `13`, pega el JSON y escribe `FIN` en una línea independiente.
-4. El programa valida todo el bloque sin enviar escrituras. Si alguna instrucción
-   es inválida, lo rechaza completo e informa el problema.
-5. Revisa el modelo, el resumen y la lista completa de objetos en orden. Responde
-   `s` si quieres ver también todas las expresiones y propiedades.
-6. Escribe exactamente `CONFIRMAR` una sola vez para ejecutar el bloque. Una
-   eliminación usa esta misma confirmación explícita y muestra una advertencia
-   sobre dependencias. El servidor puede solicitar además su propio consentimiento.
+4. El programa valida todo el bloque antes de escribir. Si alguna instrucción es
+   inválida, informa el problema y no ejecuta el lote.
+5. Imprime el resumen y ejecuta automáticamente, sin CONFIRMAR ni s/N. Con --debug
+   muestra las expresiones y propiedades completas sin preguntar.
+6. Muestra resultados y estado de recuperación. Regresa al menú sin pedir Enter.
 
 Ejemplo individual:
 
@@ -359,7 +475,7 @@ python codificar.py cliente.py codigo.txt
 ```
 
 La primera versión de bloques pasó **84 pruebas automatizadas**, incluidas las 51 de regresión del cliente
-anterior y 33 nuevas para bloques. La versión con recuperación pasa 98. Se cubren creación individual, 300 creaciones,
+anterior y 33 nuevas para bloques. La versión actual pasa 119. Se cubren creación individual, 300 creaciones,
 modificaciones y eliminaciones múltiples, mezcla de acciones, tablas diferentes,
 JSON inválido y claves duplicadas, listas permitidas, conflictos, conexiones,
 confirmación única, dependencias, columnas importadas, respuestas MCP vacías,
@@ -460,7 +576,7 @@ Pruebas automatizadas sin Power BI ni dependencias externas:
 python -m unittest discover -s tests -v
 ```
 
-Las 51 pruebas iniciales de regresión se conservan dentro de las 98 actuales. Simulan selección y cambio de modelos, respuestas de conexión en ambos
+Las 51 pruebas iniciales de regresión se conservan dentro de las 119 actuales. Simulan selección y cambio de modelos, respuestas de conexión en ambos
 formatos, conexiones cerradas y puertos reutilizados, lectura, filtros, estructuras
 MCP anidadas, solicitudes con los esquemas reales, escritura bloqueada,
 confirmaciones, edición y eliminación múltiple, errores parciales, plazos,
