@@ -1,10 +1,28 @@
+
 {
   "operations": [
     {
       "action": "create_measure",
-      "table": "NOMBRE_TABLA",
+      "table": "Medidas",
+      "name": "PRUEBA_IA_002",
+      "expression": "100"
+    },
+    {
+      "action": "create_measure",
+      "table": "Medidas",
+      "name": "PRUEBA_IA_003",
+      "expression": "200"
+    },
+    {
+      "action": "update_measure",
+      "table": "Medidas",
       "name": "PRUEBA_IA_001",
-      "expression": "10 + 20"
+      "expression": "50 + 50"
+    },
+    {
+      "action": "delete_measure",
+      "table": "Medidas",
+      "name": "PRUEBA_IA_002"
     }
   ]
 }
