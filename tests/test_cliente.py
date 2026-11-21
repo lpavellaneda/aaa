@@ -77,7 +77,7 @@ class ClientTests(unittest.TestCase):
             c.connect(self.client)
         self.assertEqual(self.client.connection_name, 'nueva-conexion')
         self.assertEqual(self.client.model_name, 'Prueba')
-        req = self.client.calls[-1][1]['request']
+        req = next(args['request'] for tool, args in self.client.calls if args['request']['operation'] == 'Connect')
         self.assertEqual(req['connectionString'], INSTANCE['connectionString'])
         self.assertNotIn('connectionName', req)
 
