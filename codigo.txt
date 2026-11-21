@@ -2,6 +2,8 @@
 0|import csv
 0|import difflib
 0|import json
+0|import os
+0|import uuid
 0|import time
 0|import queue
 0|import re
@@ -1171,16 +1173,302 @@
 4|return plan, list(dict.fromkeys(warnings))
 0|
 0|
+0|RECOVERY_VOLATILE = {'modifiedTime', 'structureModifiedTime', 'state', 'errorMessage'}
+0|
+0|
+0|def dependency_report(client):
+4|"""Read engine dependencies when supported, explicitly disclose missing scope."""
+4|report = {'engine': False, 'complete': False, 'rows': [], 'warnings': [
+8|'No se verifican todos los usos en visuales, filtros, marcadores ni otros objetos del informe; el MCP consulta el modelo semantico, no el informe completo.']}
+4|try:
+8|fields = ai_query_fields(client, {'query': 'EVALUATE INFO.CALCDEPENDENCY()', 'maxRows': 100000})
+8|rows = dax_rows(request_call(client, 'dax_query_operations', 'Execute', **fields))
+8|required = {'[OBJECT]', '[REFERENCED_OBJECT]', '[OBJECT_TYPE]', '[REFERENCED_OBJECT_TYPE]'}
+8|if rows and not required <= rows[0].keys():
+12|raise RuntimeError('El motor devuelve otro formato de dependencias')
+8|report.update(engine=True, complete=len(rows) < 100000, rows=rows)
+8|if not report['complete']:
+12|report['warnings'].append('La respuesta de dependencias alcanzo el limite; el resultado es parcial.')
+4|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+8|report['warnings'].append('No fue posible verificar dependencias con el motor: ' + str(exc) + '. Se usa el analisis DAX local, que es aproximado.')
+8|if not client.connection_name:
+12|raise RuntimeError('Conexion perdida durante la consulta de dependencias') from exc
+4|return report
+0|
+0|
+0|def check_engine_dependencies(plan, report):
+4|if not report['engine']:
+8|return
+4|changes = {}
+4|deletes = {}
+4|for i, item in enumerate(plan):
+8|op = item['instruction']
+8|if item['tool'] not in ('measure_operations', 'column_operations'):
+12|continue
+8|key = (item['tool'], op['table'].casefold(), op['name'].casefold())
+8|changes.setdefault(key, []).append((i, item))
+8|if item['operation'] == 'Delete':
+12|deletes[key] = i
+4|for row in report['rows']:
+8|target_type = str(row.get('[REFERENCED_OBJECT_TYPE]', '')).upper()
+8|target_tool = 'measure_operations' if target_type == 'MEASURE' else 'column_operations'
+8|key = (target_tool, str(row.get('[REFERENCED_TABLE]', '')).casefold(), str(row.get('[REFERENCED_OBJECT]', '')).casefold())
+8|if key not in deletes:
+12|continue
+8|source_type = str(row.get('[OBJECT_TYPE]', '')).upper()
+8|source_tool = 'measure_operations' if source_type == 'MEASURE' else 'column_operations'
+8|source = (source_tool, str(row.get('[TABLE]', '')).casefold(), str(row.get('[OBJECT]', '')).casefold())
+8|if source == key:
+12|continue
+8|resolved = False
+8|for index, change in changes.get(source, []):
+12|if index >= deletes[key]:
+16|break
+12|if change['operation'] == 'Delete':
+16|resolved = True
+12|elif 'expression' in change['instruction']:
+16|refs = dax_references(change['instruction']['expression'])
+16|resolved = not any(name == key[2] and (table is None or table == key[1]) for table, name in refs)
+8|if not resolved:
+12|raise ValueError('Dependencia detectada por el motor: ' + str(row.get('[TABLE]', '?')) +
+29|'[' + str(row.get('[OBJECT]', '?')) + '] utiliza el objeto que se intenta eliminar. Modifica o elimina primero el dependiente.')
+0|
+0|
+0|def target_state(client, tool, reference):
+4|matches = [row for row in list_objects(client, tool) if row.get('name') == reference['name'] and
+15|row.get('tableName') == reference['tableName']]
+4|return get_object(client, tool, reference) if matches else None
+0|
+0|
+0|def stable_state(value):
+4|if isinstance(value, dict):
+8|value = dict(value)
+8|if 'name' in value and 'tableName' in value:
+12|for key in ('description', 'displayFolder', 'formatString'):
+16|value[key] = value.get(key) or ''
+12|for key in ('annotations', 'extendedProperties'):
+16|value[key] = value.get(key) or []
+8|return {key: stable_state(item) for key, item in value.items() if key not in RECOVERY_VOLATILE}
+4|if isinstance(value, list):
+8|return [stable_state(item) for item in value]
+4|return value
+0|
+0|
+0|def check_semantic_state(state):
+4|if state is None:
+8|return
+4|error = state.get('errorMessage')
+4|status = str(state.get('state', '')).casefold()
+4|if (isinstance(error, str) and error.strip()) or 'error' in status:
+8|raise RuntimeError('El motor marco el objeto con error semantico: ' +
+27|str(error or state.get('state')))
+0|
+0|
+0|def save_recovery_file(path, data):
+4|"""Persist before writing the model. Atomic replacement prevents half a journal."""
+4|temporary = path.with_suffix('.tmp')
+4|with temporary.open('w', encoding='utf-8', newline='\n') as stream:
+8|json.dump(data, stream, ensure_ascii=False, indent=2)
+8|stream.flush()
+8|os.fsync(stream.fileno())
+4|temporary.replace(path)
+0|
+0|
+0|def create_plan_backup(client, plan):
+4|folder = Path(getattr(client, 'backup_dir', Path.cwd() / 'backups'))
+4|folder.mkdir(parents=True, exist_ok=True)
+4|path = folder / ('bloque_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex + '.json')
+4|data = {'format': 1, 'model': client.model_name, 'connectionName': client.connection_name,
+12|'instance': {key: (client.instance or {}).get(key) for key in ('port', 'processId', 'startTime', 'parentWindowTitle')},
+12|'status': 'preparado', 'recovery': 'no_necesaria', 'targets': [], 'journal': [],
+12|'plan': [item['instruction'] for item in plan],
+12|'scope': 'Estado de objetos del modelo; no es una copia completa del PBIX/PBIP ni del informe.'}
+4|seen = set()
+4|for item in plan:
+8|if item['operation'] == 'Execute':
+12|continue
+8|ref = object_reference(ai_object(item['instruction']))
+8|key = (item['tool'], ref['tableName'], ref['name'])
+8|if key in seen:
+12|continue
+8|seen.add(key)
+8|before = target_state(client, item['tool'], ref)
+8|target = {'tool': item['tool'], 'reference': ref, 'before': before}
+8|if before and operation_supported(client, item['tool'], 'ExportTMDL'):
+12|try:
+16|target['tmdlExport'] = request_call(client, item['tool'], 'ExportTMDL', references=[ref],
+50|tmdlExportOptions={'maxReturnCharacters': -1})
+12|except (RuntimeError, ValueError) as exc:
+16|target['tmdlExportError'] = str(exc)
+16|print('AVISO: respaldo JSON disponible; no se pudo exportar TMDL:', exc)
+8|data['targets'].append(target)
+4|save_recovery_file(path, data)
+4|print('Respaldo local:', path.resolve())
+4|client.last_backup_path = str(path.resolve())
+4|return path, data
+0|
+0|
+0|def transaction_request(client, operation, transaction_id=None):
+4|req = {'operation': operation}
+4|if operation == 'Begin':
+8|req['connectionName'] = client.connection_name
+4|else:
+8|req['transactionId'] = transaction_id
+4|root = tool_schema(client, 'transaction_operations')
+4|validate_schema(root, root, {'request': req})
+4|return unwrap_result(client.tool('transaction_operations', {'request': req}))
+0|
+0|
+0|def transaction_id(value):
+4|if isinstance(value, dict):
+8|if isinstance(value.get('transactionId'), str):
+12|return value['transactionId']
+8|for child in value.values():
+12|found = transaction_id(child)
+12|if found:
+16|return found
+4|return None
+0|
+0|
+0|def restore_definition(client, tool, state):
+4|props = definition_properties(client, tool)
+4|result = {key: value for key, value in state.items() if key in props and key not in RECOVERY_VOLATILE}
+4|if tool == 'measure_operations':
+8|result.pop('dataType', None)  # Inferred by the expression, not freely writable.
+4|for key in ('description', 'displayFolder', 'formatString'):
+8|if key in props:
+12|result[key] = state.get(key) or ''
+4|for key in ('annotations', 'extendedProperties'):
+8|if key in props:
+12|result[key] = state.get(key) or []
+4|return result
+0|
+0|
+0|def verify_backup(client, backup):
+4|differences = []
+4|for target in backup['targets']:
+8|try:
+12|current = target_state(client, target['tool'], target['reference'])
+12|if stable_state(current) != stable_state(target['before']):
+16|differences.append(target['reference']['tableName'] + '[' + target['reference']['name'] + ']: estado distinto')
+12|elif current and target['before']:
+16|before_error = target['before'].get('errorMessage') or 'error' in str(target['before'].get('state', '')).casefold()
+16|if not before_error:
+20|check_semantic_state(current)
+8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+12|differences.append(target['reference']['name'] + ': no se pudo verificar: ' + str(exc))
+4|return differences
+0|
+0|
+0|def recover_plan(client, path, backup, tx):
+4|print('\nRECUPERACION: intentando restaurar el estado anterior...')
+4|recovery_errors = []
+4|if tx:
+8|if not backup.get('transactionClosed'):
+12|try:
+16|transaction_request(client, 'Rollback', tx)
+16|backup['transactionClosed'] = True
+12|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+16|recovery_errors.append('Rollback del servidor: ' + str(exc))
+8|# Reuse the same known connection only if the original process and model
+8|# are still available; never attach recovery to another Desktop instance.
+8|if not client.connection_name and getattr(client, 'process', None) is not None and client.process.poll() is None:
+12|client.connection_name = backup['connectionName']
+12|client.model_name = backup['model']
+12|client.instance = backup['instance']
+12|ensure_connected(client)
+8|differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; no se pudo verificar el modelo']
+8|if not differences and backup.get('transactionClosed'):
+12|backup['recovery'] = 'verificada'
+12|backup['recoveryErrors'] = recovery_errors
+12|save_recovery_file(path, backup)
+12|print('RECUPERACION VERIFICADA: los objetos afectados coinciden con el respaldo previo.')
+12|return True
+8|# Never issue compensating writes while a server transaction may still be open.
+8|if not backup.get('transactionClosed'):
+12|backup['recovery'] = 'incompleta'
+12|backup['recoveryErrors'] = recovery_errors + differences
+12|save_recovery_file(path, backup)
+12|print('RECUPERACION NO VERIFICADA. Conserva el respaldo:', path)
+12|return False
+4|if client.connection_name == backup['connectionName'] and ensure_connected(client):
+8|for entry in reversed(backup['journal']):
+12|if entry.get('operation') == 'Execute':
+16|continue
+12|tool, ref, before = entry['tool'], entry['reference'], entry['before']
+12|try:
+16|current = target_state(client, tool, ref)
+16|if stable_state(current) == stable_state(before):
+20|continue
+16|if before is None:
+20|fields = build_object_fields(client, tool, 'Delete', ref)
+20|request_call(client, tool, 'Delete', **fields)
+16|else:
+20|operation = 'Update' if current else 'Create'
+20|definition = restore_definition(client, tool, before)
+20|fields = build_object_fields(client, tool, operation, definition)
+20|request_call(client, tool, operation, **fields)
+12|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+16|recovery_errors.append(ref['name'] + ': ' + str(exc))
+4|else:
+8|recovery_errors.append('No se puede restaurar con certeza la conexion original')
+4|differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; verificacion pendiente']
+4|backup['recovery'] = 'verificada' if not differences else 'incompleta'
+4|backup['recoveryErrors'] = recovery_errors + differences
+4|save_recovery_file(path, backup)
+4|if not differences:
+8|print('RECUPERACION VERIFICADA para los objetos respaldados; no implica restauracion del informe completo.')
+8|return True
+4|print('RECUPERACION INCOMPLETA. Diferencias o errores:')
+4|for message in recovery_errors + differences:
+8|print('-', message)
+4|print('Respaldo para revision:', path)
+4|return False
+0|
+0|
 0|def execute_ai_plan(client, plan):
-4|"""No retries, no reordering and no promised rollback; stop at first failure."""
+4|"""Back up first; use server transaction when available, otherwise compensate."""
 4|connection = client.connection_name
+4|writes = any(item['operation'] != 'Execute' for item in plan)
+4|path, backup = create_plan_backup(client, plan) if writes else (None, None)
+4|tx = None
+4|client.last_recovery = 'no_necesaria'
+4|has_queries = any(item['operation'] == 'Execute' for item in plan)
+4|if writes and not has_queries and 'transaction_operations' in client.tools and all(
+12|operation_supported(client, 'transaction_operations', op) for op in ('Begin', 'Commit', 'Rollback')):
+8|tx = transaction_id(transaction_request(client, 'Begin'))
+8|if not tx:
+12|backup['status'] = 'inicio_transaccion_no_confirmado'
+12|save_recovery_file(path, backup)
+12|raise RuntimeError('El servidor no devolvio transactionId. No se enviaron cambios del bloque.')
+8|backup['transactionId'] = tx
+8|try:
+12|save_recovery_file(path, backup)
+8|except OSError:
+12|transaction_request(client, 'Rollback', tx)
+12|raise
+8|print('Proteccion: transaccion del servidor; la recuperacion se verificara por lectura.')
+4|elif writes:
+8|print('Proteccion: respaldo y compensacion de cambios; este bloque no usa transaccion global.')
+8|if has_queries:
+12|print('El bloque contiene consultas DAX: se usa compensacion para que vean los cambios ya aplicados; el servidor DAX utiliza otra sesion.')
 4|results = []
+4|failed = False
 4|for index, item in enumerate(plan, 1):
 8|op, tool, operation = item['instruction'], item['tool'], item['operation']
 8|try:
 12|if client.connection_name != connection or not ensure_connected(client) or client.connection_name != connection:
 16|raise RuntimeError('Conexion cambiada o perdida; lote detenido')
-12|value = request_call(client, tool, operation, **item['fields'])
+12|fields = dict(item['fields'])
+12|if operation != 'Execute':
+16|ref = object_reference(ai_object(op))
+16|backup['journal'].append({'index': index, 'tool': tool, 'operation': operation, 'reference': ref,
+42|'before': target_state(client, tool, ref), 'status': 'enviando'})
+16|backup['status'] = 'ejecutando'
+16|save_recovery_file(path, backup)
+16|if tx and 'options' in fields:
+20|fields['options'] = dict(fields['options'], useTransaction=False)
+12|value = request_call(client, tool, operation, **fields)
 12|if tool == 'dax_query_operations':
 16|rows = dax_rows(value)
 16|display_grid(rows)
@@ -1188,18 +1476,69 @@
 20|print('Se alcanzo el limite de filas; el resultado puede estar truncado.')
 12|elif not verify_write(client, tool, operation, ai_object(op)):
 16|raise RuntimeError('Resultado no confirmado por lectura; revisa el modelo antes de reintentar')
-12|print(f'[{index}/{len(plan)}] Correcta: {AI_LABELS[op["action"]]} ' + op.get('name', 'consulta'))
+12|if operation != 'Execute' and not tx and operation != 'Delete':
+16|check_semantic_state(target_state(client, tool, object_reference(ai_object(op))))
+12|if operation != 'Execute':
+16|backup['journal'][-1]['status'] = 'verificada'
+16|save_recovery_file(path, backup)
+12|label = 'Verificada, pendiente de Commit' if tx else 'Correcta'
+12|print(f'[{index}/{len(plan)}] {label}: {AI_LABELS[op["action"]]} ' + op.get('name', 'consulta'))
 12|results.append({'index': index, 'action': op['action'], 'status': 'correcta'})
-8|except (ValueError, RuntimeError, TimeoutError, OSError, KeyError, TypeError) as exc:
+8|except (ValueError, RuntimeError, TimeoutError, OSError, KeyError, TypeError, KeyboardInterrupt) as exc:
 12|invalidate_on_error(client, exc)
 12|print(f'[{index}/{len(plan)}] ERROR: {exc}')
 12|results.append({'index': index, 'action': op['action'], 'status': 'fallida', 'error': str(exc)})
+12|failed = True
 12|break
+4|if not failed and tx:
+8|try:
+12|final = [(target, target_state(client, target['tool'], target['reference'])) for target in backup['targets']]
+12|transaction_request(client, 'Commit', tx)
+12|backup['transactionClosed'] = True
+12|for target, expected in final:
+16|current = target_state(client, target['tool'], target['reference'])
+16|check_semantic_state(current)
+16|# SaveChanges/Commit resolves inferred types. Compare requested types
+16|# exactly, but do not mistake normal inference for a failed commit.
+16|explicit_type = any(item['tool'] == target['tool'] and
+36|item['instruction'].get('name') == target['reference']['name'] and
+36|item['instruction'].get('table') == target['reference']['tableName'] and
+36|'dataType' in item['instruction'] for item in plan)
+16|if current is not None and expected is not None and not explicit_type:
+20|current, expected = dict(current), dict(expected)
+20|current.pop('dataType', None)
+20|expected.pop('dataType', None)
+16|if stable_state(current) != stable_state(expected):
+20|raise RuntimeError('El estado despues de Commit no coincide con el esperado')
+8|except (ValueError, RuntimeError, TimeoutError, OSError, KeyboardInterrupt) as exc:
+12|failed = True
+12|backup['commitError'] = str(exc)
+12|print('ERROR AL CONFIRMAR LA TRANSACCION:', exc)
+4|if writes:
+8|backup['results'] = results
+8|backup['status'] = 'fallido' if failed else 'completado'
+8|if failed:
+12|recover_plan(client, path, backup, tx)
+12|client.last_recovery = backup['recovery']
+12|for row in results:
+16|row['recovery'] = backup['recovery']
+12|save_recovery_file(path, backup)
+8|else:
+12|save_recovery_file(path, backup)
+4|client.last_block_status = 'fallido' if failed else 'completado'
 4|skipped = len(plan) - len(results)
 4|print('\nRESULTADO FINAL')
-4|print('Correctas:', sum(r['status'] == 'correcta' for r in results))
-4|print('Fallidas:', sum(r['status'] == 'fallida' for r in results))
+4|print('Verificadas antes de recuperacion:' if writes and failed else 'Correctas:',
+10|sum(r['status'] == 'correcta' for r in results))
+4|print('Fallidas:', sum(r['status'] == 'fallida' for r in results) + int(bool(backup and backup.get('commitError'))))
 4|print('No ejecutadas:', skipped)
+4|print('Estado final del bloque:', client.last_block_status)
+4|if writes and failed:
+8|print('Estado de recuperacion:', client.last_recovery, '(los exitos anteriores no equivalen a cambios conservados)')
+8|if client.last_recovery == 'verificada':
+12|print('Cambios del bloque conservados: 0; se restauro el estado anterior de los objetos respaldados.')
+8|if backup.get('commitError'):
+12|print('Fallo final de Commit:', backup['commitError'])
 4|for row in results:
 8|if row.get('error'):
 12|print(f'Detalle del error [{row["index"]}]: {row["error"]}')
@@ -1219,6 +1558,9 @@
 4|operations = parse_ai_block('\n'.join(lines))
 4|print('Validando instrucciones...')
 4|plan, warnings = validate_ai_block(client, operations)
+4|dependencies = dependency_report(client)
+4|check_engine_dependencies(plan, dependencies)
+4|warnings.extend(dependencies['warnings'])
 4|print('\nModelo de destino:', client.model_name)
 4|counts = {}
 4|for item in plan:
@@ -1234,11 +1576,11 @@
 8|print(f'{i}. {AI_LABELS[op["action"]]} ' + (f'{op["table"]}[{op["name"]}]' if 'name' in op else 'consulta DAX'))
 4|for warning in warnings:
 8|print('AVISO:', warning)
-4|print('El analisis DAX es aproximado; no detecta todas las dependencias de visuales o del modelo.')
+4|print('Dependencias del motor:', len(dependencies['rows']) if dependencies['engine'] else 'no disponibles')
 4|if input('¿Deseas ver expresiones y propiedades completas? (s/N): ').strip().lower() == 's':
 8|pretty([item['instruction'] for item in plan])
 4|if any(item['operation'] != 'Execute' for item in plan):
-8|print('Guarda copia del PBIX. No hay transaccion global ni reversion automatica; los cambios completados pueden permanecer.')
+8|print('Se creara un respaldo local antes de escribir. Si falla el bloque se intentara restaurar y verificar el estado anterior. No es una copia completa del PBIX/PBIP.')
 4|if any(item['operation'] == 'Delete' for item in plan):
 8|print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
 4|if input('Escribe CONFIRMAR para ejecutar el bloque completo: ').strip() != 'CONFIRMAR':
@@ -1303,6 +1645,7 @@
 4|parser.add_argument('--write', action='store_true', help='Habilitar edicion')
 4|parser.add_argument('--debug', action='store_true', help='Mostrar respuestas MCP completas')
 4|parser.add_argument('--server', type=Path, help='Ejecutable autorizado (opcional)')
+4|parser.add_argument('--backup-dir', type=Path, default=Path.cwd() / 'backups', help='Carpeta local de respaldos de bloques')
 4|opts = parser.parse_args()
 4|if opts.write:
 8|print('MODO EDICION. Haz copia del PBIX antes de modificarlo.')
@@ -1311,6 +1654,7 @@
 4|else:
 8|print('SOLO LECTURA. Para editar: python cliente.py --write')
 4|client = MCP(opts.write, opts.server, opts.debug)
+4|client.backup_dir = opts.backup_dir
 4|try:
 8|try:
 12|connect(client)
