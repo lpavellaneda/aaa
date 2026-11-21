@@ -1,0 +1,7 @@
+{
+  "operations": [
+    {"action": "create_column", "table": "Medidas", "name": "TEST_COLUMNA_TEMP", "expression": "1"},
+    {"action": "update_column", "table": "Medidas", "name": "TEST_COLUMNA_TEMP", "expression": "2"},
+    {"action": "delete_column", "table": "Medidas", "name": "TEST_COLUMNA_TEMP"}
+  ]
+}
