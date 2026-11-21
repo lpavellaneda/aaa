@@ -1,1 +1,10 @@
-curl.exe -I -L --max-time 15 https://chatgpt.com
+{
+  "operations": [
+    {
+      "action": "create_measure",
+      "table": "NOMBRE_TABLA",
+      "name": "PRUEBA_IA_001",
+      "expression": "10 + 20"
+    }
+  ]
+}
