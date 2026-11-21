@@ -31,8 +31,8 @@ python cliente.py --write
 ```
 
 El programa pide `EDITAR` al iniciar. Guarda una copia del PBIX. Cada lote muestra
-la vista previa y requiere escribir exactamente `CONFIRMAR`. Los lotes se envían
-objeto por objeto: no constituyen una transacción global. Se informa el resultado
+la vista previa y requiere escribir exactamente `CONFIRMAR`. Los formularios de las opciones 4 a 9 envían los objetos
+individualmente; la opción 13 incorpora la protección descrita más abajo. Se informa el resultado
 individual y se conservan los cambios que ya fueron confirmados si otro falla.
 El servidor puede solicitar además su propio consentimiento.
 
@@ -79,6 +79,152 @@ La opción avanzada conserva el ingreso manual de JSON del cliente original.
 Sus operaciones de modelo usan explícitamente la conexión activa y rechazan un
 identificador diferente. Una operación avanzada que cambie conexiones invalida
 la selección del menú y obliga a elegir nuevamente el modelo.
+
+## Respaldo y recuperación de bloques (opción 13)
+
+La opción 13 conserva el orden y la confirmación única, y ahora respalda el estado
+previo y comprueba la recuperación cuando falla el bloque. Las opciones 1 a 12
+siguen disponibles; los formularios 4 a 9 y el modo avanzado conservan su
+funcionamiento anterior. El diario y la recuperación global descritos aquí
+protegen los bloques de la opción 13.
+
+### Respaldo antes de escribir
+
+Se crea `backups/bloque_FECHA_HORA_IDENTIFICADOR.json` en la carpeta de ejecución.
+Incluye el modelo y su conexión original, las instrucciones, el estado completo
+devuelto por Get para cada objeto afectado, exportaciones TMDL cuando el servidor
+las permite y un diario guardado antes de cada escritura. Se escribe de forma
+atómica y se fuerza su guardado en disco. Si el respaldo inicial no puede
+guardarse, el cliente no envía las escrituras del bloque.
+
+Puedes elegir otra carpeta local autorizada:
+
+```powershell
+python cliente.py --write --backup-dir "D:\RespaldosPowerBI"
+```
+
+El respaldo contiene metadatos y fórmulas del modelo: consérvalo según las reglas
+de tu organización. No se publica en GitHub. No es una copia del archivo PBIX o
+del proyecto PBIP, de sus datos, visuales, filtros o archivos de informe.
+
+### Dos vías de protección comprobadas
+
+1. **Bloque solo de escrituras:** si el esquema del servidor ofrece Begin, Commit
+   y Rollback, se abre una transacción. Cada resultado individual se muestra como
+   verificado y pendiente de Commit. Al terminar se confirma y se vuelve a leer el
+   estado. Si falla una instrucción, se solicita Rollback y se compara cada objeto
+   afectado con su respaldo original.
+2. **Bloque con escrituras y consultas DAX, o servidor sin transacciones:** se
+   aplican las instrucciones en orden y se usa recuperación por compensación en
+   caso de fallo. Se recorre el diario en orden inverso: se borran creaciones, se
+   restauran propiedades anteriores y se recrean objetos eliminados. Se verifican
+   después todos los objetos respaldados. Esta vía no es atómica y otros clientes
+   pueden ver cambios intermedios.
+
+La segunda vía es necesaria en este servidor: las consultas DAX no ven medidas
+nuevas pendientes de una transacción de modelado. Se comprobó con el ejecutable
+de la extensión instalada; no se cambia silenciosamente el orden para resolverlo.
+
+El cliente detecta estados y mensajes de error semántico después de escribir o
+confirmar. Una expresión presente en Get no basta para anunciar éxito: el servidor
+puede guardar una fórmula inválida y marcar el objeto con SemanticError. Si esto
+se descubre después de Commit, se intenta compensar desde el respaldo porque la
+transacción ya está cerrada.
+
+### Cómo leer el resultado
+
+- `Estado final del bloque: completado`: las operaciones terminaron y, cuando
+  correspondía, se confirmó la transacción y se verificó el estado posterior.
+- `Estado final del bloque: fallido`: hubo un error de operación o de confirmación
+  final. Los contadores de operaciones anteriores no significan que sus cambios
+  se hayan conservado.
+- `RECUPERACION VERIFICADA`: los objetos afectados coinciden con sus estados
+  respaldados. Se normalizan valores vacíos equivalentes y no se exige recuperar
+  marcas de tiempo o estados derivados. Se comprueba que no aparezcan nuevos
+  errores semánticos. No significa restauración completa de todo el PBIP/PBIX.
+- `RECUPERACION INCOMPLETA / NO VERIFICADA`: quedan diferencias, errores o no se
+  pudo consultar con certeza la conexión original. Se muestra la ruta del respaldo
+  y el archivo registra los errores. No se anuncia reversión completa.
+
+Si Rollback no puede cerrar la transacción, el cliente no envía compensaciones
+dentro de esa transacción incierta. Una conexión perdida solo se reutiliza cuando
+se puede verificar la misma instancia original; no se cambia a otro modelo.
+No hay recuperación automática al reiniciar el programa después de un cierre
+forzado: el diario queda disponible para revisión. Sigue siendo recomendable una
+copia del proyecto y evitar cambios concurrentes desde otras aplicaciones.
+
+### Dependencias comprobadas por el motor
+
+La opción 13 ejecuta `EVALUATE INFO.CALCDEPENDENCY()` mediante la herramienta DAX
+existente. En el modelo de prueba devolvió inicialmente 457 registros. Se
+contrastan referencias del motor con las eliminaciones y las modificaciones
+previas del bloque; también se conserva el análisis local para las medidas nuevas
+que todavía no existen en el motor. Si la consulta no está disponible en otra
+versión, los formatos cambian o se alcanza el límite de 100000 filas, se indica
+expresamente que la comprobación es parcial o no estuvo disponible.
+
+El servidor semántico no permite garantizar todos los usos en visuales, filtros,
+marcadores y otros objetos de un informe. Ese ámbito se advierte expresamente
+antes de la confirmación; no se presenta como verificado.
+
+### Pruebas de esta mejora, realizadas en el modelo abierto
+
+El cliente utilizó el ejecutable de la extensión de VS Code de este equipo. Las
+tablas se eligieron del catálogo real y los nombres de prueba fueron únicos;
+ninguna tabla ni medida del programa depende de los nombres particulares de BI.
+
+| Prueba real | Resultado |
+| --- | --- |
+| Crear 50 medidas en un bloque | 50 verificadas; Commit y lectura posterior correctos |
+| Modificar 50 medidas en un bloque | Expresión, descripción y formato aplicados y verificados |
+| Eliminar 20 medidas con sintaxis abreviada | 20 ausencias verificadas |
+| Bloque mixto de 20 operaciones | Crear, modificar, eliminar y 5 consultas DAX correctas |
+| Dependencias entre medidas | Detectadas por el motor y por el cliente; bloqueo de eliminación de la base |
+| Quitar dependencia y eliminar la base | Orden respetado y cambios verificados |
+| Error intermedio con transacción | Fallo MCP intencional en el paso 4; paso 5 no enviado; Rollback restauró lo anterior |
+| Error intermedio sin transacción | Fallo DAX en el paso 4; recuperación por compensación verificada |
+| Fórmula DAX inválida | SemanticError detectado después de Commit y recuperación compensatoria verificada |
+| Sesión MCP independiente | Vio el valor guardado 200 y lo evaluó con DAX |
+| Recuperación desde otro proceso MCP | Comprobó metadatos y valores DAX 1 y 2 tras Rollback, compensación y SemanticError |
+| Limpieza final | No quedaron objetos generados por la prueba |
+
+Para provocar un error real del MCP durante la transacción, la prueba inyecta una
+consulta DAX inválida antes del cuarto cambio. No simula la respuesta: el error
+lo devuelve el servidor real. La consulta inválida del bloque sin transacción y
+la fórmula inválida también se enviaron realmente al servidor.
+
+Durante las pruebas se corrigieron tres problemas reales: confundir el cambio de
+tipo inferido Unknown a Int64 al confirmar con un fallo; consultas que no veían
+medidas pendientes de Commit; y fórmulas inválidas guardadas como SemanticError.
+También se separó el estado final del bloque de los contadores individuales para
+que un fallo de Commit no aparezca como éxito global.
+
+Pasaron **98 pruebas automatizadas**: las anteriores más casos de respaldo,
+transacción, compensación, errores de guardado, cierre/confirmación fallidos,
+recuperación incompleta, inferencia de tipo y errores semánticos. Los casos de
+disco lleno o servidor inaccesible son simulados; no se afirma haber provocado
+esas averías físicas en el equipo. No se probó guardar y reabrir el PBIP/PBIX, ni
+restaurar informes, datos, identidades de objetos complejos o todas las versiones
+del servidor. La compensación se comprobó con las propiedades de las medidas de
+prueba, no con todos los KPI, traducciones u otros metadatos posibles.
+
+Pruebas normales (sin escrituras reales):
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Pruebas reales extensas, únicamente sobre un modelo destinado a pruebas:
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python tests/live_recovery.py --modelo "Titulo del modelo" --confirmar-escrituras
+```
+
+El informe se guarda en `resultado_recuperacion.json`. Los respaldos y los informes
+locales se excluyen de Git. `codificar.py` se conserva y `codigo.txt` se regenera
+para transferir el cliente actualizado.
+
 
 ## Opción 13: ejecutar un bloque generado por IA
 
@@ -174,10 +320,10 @@ No hay búsqueda parcial, coincidencias por prefijo ni expansión de comodines.
 - Tras cada escritura se consulta el modelo con List/Get para verificar el estado,
   incluso si el servidor devuelve contenido vacío. No se anuncia éxito por el solo
   hecho de haber enviado una solicitud.
-- Al primer fallo, resultado incierto o pérdida de conexión, el lote se detiene.
-  El resumen distingue correctas, fallidas y no ejecutadas. No hay reintentos
-  automáticos, transacción global ni rollback: los cambios anteriores pueden
-  permanecer. Revisa el estado antes de generar un bloque de corrección.
+- Al primer fallo, resultado incierto o pérdida de conexión, el lote se detiene
+  e intenta recuperar el estado respaldado. El resumen distingue operaciones,
+  resultado global y recuperación verificada o incompleta. No se reintentan las
+  instrucciones originales a ciegas. Consulta la sección de respaldo y recuperación.
 
 No hay límite de cinco, diez ni cien operaciones. Una prueba simulada ejecuta
 300 operaciones. El tamaño práctico depende de memoria, tiempos del servidor y
@@ -212,8 +358,8 @@ python -m unittest discover -s tests -v
 python codificar.py cliente.py codigo.txt
 ```
 
-Pasaron **84 pruebas automatizadas**, incluidas las 51 de regresión del cliente
-anterior y 33 nuevas para bloques. Se cubren creación individual, 300 creaciones,
+La primera versión de bloques pasó **84 pruebas automatizadas**, incluidas las 51 de regresión del cliente
+anterior y 33 nuevas para bloques. La versión con recuperación pasa 98. Se cubren creación individual, 300 creaciones,
 modificaciones y eliminaciones múltiples, mezcla de acciones, tablas diferentes,
 JSON inválido y claves duplicadas, listas permitidas, conflictos, conexiones,
 confirmación única, dependencias, columnas importadas, respuestas MCP vacías,
@@ -314,7 +460,7 @@ Pruebas automatizadas sin Power BI ni dependencias externas:
 python -m unittest discover -s tests -v
 ```
 
-Las 51 pruebas de la suite pasaron. Simulan selección y cambio de modelos, respuestas de conexión en ambos
+Las 51 pruebas iniciales de regresión se conservan dentro de las 98 actuales. Simulan selección y cambio de modelos, respuestas de conexión en ambos
 formatos, conexiones cerradas y puertos reutilizados, lectura, filtros, estructuras
 MCP anidadas, solicitudes con los esquemas reales, escritura bloqueada,
 confirmaciones, edición y eliminación múltiple, errores parciales, plazos,
