@@ -4,25 +4,38 @@
     {
       "action": "create_measure",
       "table": "Medidas",
-      "name": "PRUEBA_IA_002",
-      "expression": "100"
+      "name": "DIAG_01_Series_Fact_Sin_Dim",
+      "expression": "COUNTROWS(EXCEPT(DISTINCT('Facturación'[Serie]), DISTINCT('DimImpresoras'[Serie])))"
     },
     {
       "action": "create_measure",
       "table": "Medidas",
-      "name": "PRUEBA_IA_003",
-      "expression": "200"
+      "name": "DIAG_02_Series_Vol_Sin_Dim",
+      "expression": "COUNTROWS(EXCEPT(DISTINCT('Volumen'[Serie]), DISTINCT('DimImpresoras'[Serie])))"
     },
     {
-      "action": "update_measure",
+      "action": "create_measure",
       "table": "Medidas",
-      "name": "PRUEBA_IA_001",
-      "expression": "50 + 50"
+      "name": "DIAG_03_Filas_Fact_Serie_Blank",
+      "expression": "COUNTROWS(FILTER(ALL('Facturación'), ISBLANK('Facturación'[Serie]) || TRIM('Facturación'[Serie]) = \"\"))"
     },
     {
-      "action": "delete_measure",
+      "action": "create_measure",
       "table": "Medidas",
-      "name": "PRUEBA_IA_002"
+      "name": "DIAG_04_Filas_Vol_Serie_Blank",
+      "expression": "COUNTROWS(FILTER(ALL('Volumen'), ISBLANK('Volumen'[Serie]) || TRIM('Volumen'[Serie]) = \"\"))"
+    },
+    {
+      "action": "create_measure",
+      "table": "Medidas",
+      "name": "DIAG_05_Blank_Automatico_Dim",
+      "expression": "COUNTROWS(ALL('DimImpresoras')) - COUNTROWS(ALLNOBLANKROW('DimImpresoras'))"
+    },
+    {
+      "action": "create_measure",
+      "table": "Medidas",
+      "name": "DIAG_06_Ejemplos_Series_Sin_Dim",
+      "expression": "VAR F = EXCEPT(DISTINCT('Facturación'[Serie]), DISTINCT('DimImpresoras'[Serie])) VAR V = EXCEPT(DISTINCT('Volumen'[Serie]), DISTINCT('DimImpresoras'[Serie])) RETURN \"FACT: \" & CONCATENATEX(TOPN(10, F, 'Facturación'[Serie], ASC), 'Facturación'[Serie], \" | \") & \" / VOL: \" & CONCATENATEX(TOPN(10, V, 'Volumen'[Serie], ASC), 'Volumen'[Serie], \" | \")"
     }
   ]
 }
