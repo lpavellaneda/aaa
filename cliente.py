@@ -901,6 +901,352 @@ def dax_query(client):
             save_csv(rows, name)
 
 
+AI_ACTIONS = {
+    'create_measure': ('measure_operations', 'Create'),
+    'update_measure': ('measure_operations', 'Update'),
+    'delete_measure': ('measure_operations', 'Delete'),
+    'create_column': ('column_operations', 'Create'),
+    'update_column': ('column_operations', 'Update'),
+    'delete_column': ('column_operations', 'Delete'),
+    'execute_dax': ('dax_query_operations', 'Execute'),
+}
+AI_PROPERTIES = {'description', 'displayFolder', 'formatString', 'isHidden', 'dataType'}
+AI_LABELS = {
+    'create_measure': 'Crear medida', 'update_measure': 'Modificar medida',
+    'delete_measure': 'Eliminar medida', 'create_column': 'Crear columna calculada',
+    'update_column': 'Modificar columna calculada', 'delete_column': 'Eliminar columna calculada',
+    'execute_dax': 'Consultar DAX',
+}
+
+
+def parse_ai_block(text):
+    """Strict JSON only. No code evaluation, shell commands or connection overrides."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Clave JSON duplicada: ' + key)
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError('Constante JSON no permitida: ' + value)
+
+    value = json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    if not isinstance(value, dict):
+        raise ValueError('El bloque debe ser un objeto JSON')
+    if 'operations' in value:
+        if set(value) != {'operations'} or not isinstance(value['operations'], list):
+            raise ValueError('Usa un objeto con solo operations y una lista de operaciones')
+        operations = value['operations']
+    else:
+        operations = [value]
+    if not operations:
+        raise ValueError('El bloque no contiene operaciones')
+    expanded = []
+    for index, op in enumerate(operations, 1):
+        if not isinstance(op, dict):
+            raise ValueError(f'Instruccion {index}: se requiere un objeto')
+        if op.get('action') == 'delete_measures':
+            if set(op) != {'action', 'table', 'names'} or not isinstance(op['names'], list) or not op['names']:
+                raise ValueError(f'Instruccion {index}: delete_measures requiere table y names no vacio')
+            expanded.extend({'action': 'delete_measure', 'table': op['table'], 'name': name} for name in op['names'])
+        else:
+            expanded.append(dict(op))
+    for index, op in enumerate(expanded, 1):
+        action = op.get('action')
+        if not isinstance(action, str) or action not in AI_ACTIONS:
+            raise ValueError(f'Operacion {index}: accion no permitida')
+        if action == 'execute_dax':
+            allowed, required = {'action', 'query', 'maxRows'}, {'action', 'query'}
+        else:
+            required = {'action', 'table', 'name'}
+            allowed = required if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
+            if action.startswith('create_'):
+                required = required | {'expression'}
+        if set(op) - allowed or required - set(op):
+            raise ValueError(f'Operacion {index}: campos faltantes o no permitidos: ' +
+                             ', '.join(sorted((set(op) - allowed) | (required - set(op)))))
+        for key in ('table', 'name', 'expression', 'query'):
+            if key in op and (not isinstance(op[key], str) or not op[key].strip()):
+                raise ValueError(f'Operacion {index}: {key} debe ser texto no vacio')
+        for key in AI_PROPERTIES & op.keys():
+            if (key == 'isHidden' and not isinstance(op[key], bool)) or (key != 'isHidden' and not isinstance(op[key], str)):
+                raise ValueError(f'Operacion {index}: tipo incorrecto para {key}')
+        if action.startswith('update_') and not (op.keys() & (AI_PROPERTIES | {'expression'})):
+            raise ValueError(f'Operacion {index}: no hay propiedades para modificar')
+        if 'maxRows' in op and (type(op['maxRows']) is not int or not 1 <= op['maxRows'] <= 100000):
+            raise ValueError(f'Operacion {index}: maxRows debe estar entre 1 y 100000')
+    return expanded
+
+
+def dax_references(expression):
+    """Conservative lexical scan, not a full DAX parser; ignores strings/comments."""
+    pattern = re.compile(r'"(?:[^"]|"")*"|//[^\n]*|--[^\n]*|/\*.*?\*/|'
+                         r"(?:(?:'((?:[^']|'')+)'|([\w]+))\s*)?\[((?:[^\]]|\]\])+?)\]", re.DOTALL)
+    refs = set()
+    for match in pattern.finditer(expression):
+        if match.group(3) is not None:
+            table = match.group(1) or match.group(2)
+            refs.add((table.replace("''", "'").casefold() if table else None,
+                      match.group(3).replace(']]', ']').casefold()))
+    return refs
+
+
+def ai_object(op):
+    return {'tableName': op['table'], 'name': op['name'],
+            **{key: op[key] for key in AI_PROPERTIES | {'expression'} if key in op}}
+
+
+def ai_query_fields(client, op):
+    props = request_schema(client, 'dax_query_operations').get('properties', {})
+    fields = {'query': op['query']}
+    if 'resultMode' in props:
+        fields['resultMode'] = 'Inline'
+    if 'maxRows' in props:
+        fields['maxRows'] = op.get('maxRows', 1000)
+    elif 'maxRows' in op:
+        raise ValueError('El servidor no admite maxRows')
+    return fields
+
+
+def validate_ai_block(client, operations):
+    """Preflight complete ordered plan against a virtual, case-insensitive catalog."""
+    if not client.connection_name:
+        raise ValueError('No hay conexion activa')
+    if not client.writable and any(op['action'] != 'execute_dax' for op in operations):
+        raise ValueError('El bloque contiene escrituras: inicia con --write')
+    tables = {row['name'].casefold(): row['name'] for row in list_objects(client, 'table_operations')}
+    kinds = {AI_ACTIONS[op['action']][0] for op in operations} - {'dax_query_operations'}
+    # Measures are also needed to resolve DAX references in column expressions.
+    if any('expression' in op for op in operations) or any(op['action'].startswith('delete_') for op in operations):
+        kinds.add('measure_operations')
+    inventory = {tool: {} for tool in kinds}
+    for tool in kinds:
+        for row in list_objects(client, tool):
+            if not row.get('tableName'):
+                raise ValueError('No se pudo identificar la tabla de un objeto')
+            inventory[tool][(row['tableName'].casefold(), row['name'].casefold())] = dict(row)
+    plan, warnings, seen, histories, removed = [], [], set(), {}, set()
+    relationships = list_objects(client, 'relationship_operations') if any(op['action'] == 'delete_column' for op in operations) else []
+    measure_tool = 'measure_operations'
+    # Read metadata once per tool, not once per instruction in a large block.
+    if any(op['action'].startswith('delete_') or 'expression' in op for op in operations):
+        for tool in ('measure_operations', 'column_operations'):
+            if tool not in client.tools or not operation_supported(client, tool, 'Get'):
+                warnings.append(f'{tool}: no se pueden leer todas las dependencias en esta version del servidor.')
+                continue
+            if tool not in inventory:
+                inventory[tool] = {(r['tableName'].casefold(), r['name'].casefold()): dict(r)
+                                   for r in list_objects(client, tool)}
+            rows = list(inventory[tool].values())
+            if rows:
+                details = object_rows(request_call(client, tool, 'Get', references=[object_reference(r) for r in rows]),
+                                      'measures' if tool == measure_tool else 'columns')
+                by_name = {}
+                for key in inventory[tool]:
+                    by_name.setdefault(key[1], []).append(key)
+                for detail in details:
+                    keys = [key for key in by_name.get(str(detail.get('name', '')).casefold(), []) if
+                            (not detail.get('tableName') or key[0] == detail['tableName'].casefold())]
+                    if len(keys) == 1:
+                        inventory[tool][keys[0]].update(detail)
+                if any('expression' not in r and tool == measure_tool for r in inventory[tool].values()):
+                    warnings.append('Algunas expresiones existentes no se pudieron leer; el analisis de dependencias es parcial.')
+                if tool == 'column_operations' and any('columnType' not in r for r in inventory[tool].values()):
+                    warnings.append('No se pudieron asociar todos los detalles de columnas; el analisis de dependencias es parcial.')
+    future = {(op['table'].casefold(), op['name'].casefold()): i for i, op in enumerate(operations, 1)
+              if op['action'].startswith('create_')}
+    for index, original in enumerate(operations, 1):
+        op = dict(original)
+        tool, operation = AI_ACTIONS[op['action']]
+        if not operation_supported(client, tool, operation):
+            raise ValueError(f'Operacion {index}: {tool}.{operation} no disponible')
+        fingerprint = json.dumps(op, sort_keys=True, ensure_ascii=False)
+        if fingerprint in seen:
+            raise ValueError(f'Operacion {index}: instruccion duplicada')
+        seen.add(fingerprint)
+        if tool == 'dax_query_operations':
+            for ref_table, ref_name in dax_references(op['query']):
+                if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+                    raise ValueError(f'Operacion {index}: consulta utiliza un objeto eliminado previamente: [{ref_name}]')
+                if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in future) and not any(
+                        k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+                        for rows in inventory.values() for k in rows):
+                    raise ValueError(f'Operacion {index}: consulta utiliza un objeto creado despues: [{ref_name}]')
+            fields = ai_query_fields(client, op)
+        else:
+            key = (op['table'].casefold(), op['name'].casefold())
+            if key[0] not in tables:
+                raise ValueError(f'Operacion {index}: tabla inexistente: {op["table"]}')
+            op['table'] = tables[key[0]]
+            objects = inventory[tool]
+            current = objects.get(key)
+            if operation == 'Create':
+                conflict = current or (tool == measure_tool and any(k[1] == key[1] for k in objects))
+                if conflict:
+                    raise ValueError(f'Operacion {index}: nombre ya existente: {op["name"]}')
+            elif not current:
+                raise ValueError(f'Operacion {index}: objeto inexistente: {op["table"]}[{op["name"]}]')
+            if current:
+                op['name'] = current['name']
+            target = (tool, key)
+            history = histories.setdefault(target, [])
+            if operation in history:
+                raise ValueError(f'Operacion {index}: accion repetida para el mismo objeto')
+            if history and history[-1] == 'Delete':
+                raise ValueError(f'Operacion {index}: recreacion contradictoria tras Delete; divide los bloques')
+            if history:
+                warnings.append(f'Operacion {index}: {operation} actua sobre un objeto utilizado antes en el lote.')
+            if tool == 'column_operations' and current and not history:
+                current.update(get_object(client, tool, current))
+                if not calculated_column(current):
+                    raise ValueError(f'Operacion {index}: columna de origen o tipo no compatible')
+            if operation == 'Delete':
+                if tool == 'column_operations' and any(
+                        (str(r.get(side + 'Table', '')).casefold(), str(r.get(side + 'Column', '')).casefold()) == key
+                        for r in relationships for side in ('from', 'to')):
+                    raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+                for other_tool, rows in inventory.items():
+                    for other_key, other in rows.items():
+                        if other_tool == tool and other_key == key:
+                            continue
+                        refs = dax_references(other.get('expression') or '')
+                        if any(name == key[1] and (table is None or table == key[0]) for table, name in refs):
+                            raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+                del objects[key]
+                removed.add(key)
+            else:
+                for ref_table, ref_name in dax_references(op.get('expression', '')):
+                    if ref_name == key[1] and (ref_table is None or ref_table == key[0]):
+                        raise ValueError(f'Operacion {index}: posible referencia circular al propio objeto')
+                    if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+                        raise ValueError(f'Operacion {index}: referencia a objeto eliminado previamente: [{ref_name}]')
+                    candidates = [(t, n) for t, n in future if n == ref_name and (ref_table is None or t == ref_table)]
+                    known = any(k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+                                for rows in inventory.values() for k in rows)
+                    if candidates and not known:
+                        raise ValueError(f'Operacion {index}: referencia a objeto creado despues o a si mismo: [{ref_name}]')
+                    if known:
+                        warnings.append(f'Operacion {index}: posible dependencia DAX de [{ref_name}]; se conserva el orden indicado.')
+                objects[key] = dict(current or {}, **ai_object(op))
+                if tool == 'column_operations' and operation == 'Create':
+                    objects[key]['columnType'] = 'Calculated'
+            history.append(operation)
+            fields = build_object_fields(client, tool, operation, ai_object(op))
+        root = tool_schema(client, tool)
+        req = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
+        unknown = set(fields) - request_schema(client, tool).get('properties', {}).keys()
+        if unknown:
+            raise ValueError(f'Operacion {index}: campos no admitidos por el servidor: {sorted(unknown)}')
+        validate_schema(root, root, req, f'Operacion {index}')
+        plan.append({'instruction': op, 'tool': tool, 'operation': operation, 'fields': fields})
+    # Detect indirect cycles among the measure definitions available to preflight.
+    measures = inventory.get(measure_tool, {})
+    names = {}
+    for key in measures:
+        names.setdefault(key[1], set()).add(key)
+    graph = {}
+    for key, obj in measures.items():
+        refs = dax_references(obj.get('expression') or '')
+        graph[key] = {other for table, name in refs for other in names.get(name, ())
+                      if table is None or table == other[0]}
+    touched = {(item['instruction']['table'].casefold(), item['instruction']['name'].casefold())
+               for item in plan if item['tool'] == measure_tool and item['operation'] != 'Delete'}
+    # Iterative traversal avoids Python recursion limits for long dependency chains.
+    done = set()
+    for start in touched & graph.keys():
+        stack, active = [(start, False)], set()
+        while stack:
+            node, leaving = stack.pop()
+            if leaving:
+                active.discard(node)
+                done.add(node)
+            elif node in active:
+                raise ValueError('Posible dependencia circular entre medidas; revisa las expresiones del bloque')
+            elif node not in done:
+                active.add(node)
+                stack.append((node, True))
+                stack.extend((child, False) for child in graph.get(node, ()))
+    return plan, list(dict.fromkeys(warnings))
+
+
+def execute_ai_plan(client, plan):
+    """No retries, no reordering and no promised rollback; stop at first failure."""
+    connection = client.connection_name
+    results = []
+    for index, item in enumerate(plan, 1):
+        op, tool, operation = item['instruction'], item['tool'], item['operation']
+        try:
+            if client.connection_name != connection or not ensure_connected(client) or client.connection_name != connection:
+                raise RuntimeError('Conexion cambiada o perdida; lote detenido')
+            value = request_call(client, tool, operation, **item['fields'])
+            if tool == 'dax_query_operations':
+                rows = dax_rows(value)
+                display_grid(rows)
+                if len(rows) >= item['fields'].get('maxRows', 1000):
+                    print('Se alcanzo el limite de filas; el resultado puede estar truncado.')
+            elif not verify_write(client, tool, operation, ai_object(op)):
+                raise RuntimeError('Resultado no confirmado por lectura; revisa el modelo antes de reintentar')
+            print(f'[{index}/{len(plan)}] Correcta: {AI_LABELS[op["action"]]} ' + op.get('name', 'consulta'))
+            results.append({'index': index, 'action': op['action'], 'status': 'correcta'})
+        except (ValueError, RuntimeError, TimeoutError, OSError, KeyError, TypeError) as exc:
+            invalidate_on_error(client, exc)
+            print(f'[{index}/{len(plan)}] ERROR: {exc}')
+            results.append({'index': index, 'action': op['action'], 'status': 'fallida', 'error': str(exc)})
+            break
+    skipped = len(plan) - len(results)
+    print('\nRESULTADO FINAL')
+    print('Correctas:', sum(r['status'] == 'correcta' for r in results))
+    print('Fallidas:', sum(r['status'] == 'fallida' for r in results))
+    print('No ejecutadas:', skipped)
+    for row in results:
+        if row.get('error'):
+            print(f'Detalle del error [{row["index"]}]: {row["error"]}')
+    return results
+
+
+def ai_block(client):
+    if not ensure_connected(client):
+        return []
+    print('Pega el bloque JSON generado por IA. Escribe FIN en una linea independiente para terminar:')
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == 'FIN':
+            break
+        lines.append(line)
+    operations = parse_ai_block('\n'.join(lines))
+    print('Validando instrucciones...')
+    plan, warnings = validate_ai_block(client, operations)
+    print('\nModelo de destino:', client.model_name)
+    counts = {}
+    for item in plan:
+        action = item['instruction']['action']
+        counts[action] = counts.get(action, 0) + 1
+    print('Operaciones detectadas:')
+    for action, count in counts.items():
+        print(f'- {AI_LABELS[action]}: {count}')
+    print('Total:', len(plan), 'operaciones')
+    print('Vista previa completa en orden:')
+    for i, item in enumerate(plan, 1):
+        op = item['instruction']
+        print(f'{i}. {AI_LABELS[op["action"]]} ' + (f'{op["table"]}[{op["name"]}]' if 'name' in op else 'consulta DAX'))
+    for warning in warnings:
+        print('AVISO:', warning)
+    print('El analisis DAX es aproximado; no detecta todas las dependencias de visuales o del modelo.')
+    if input('¿Deseas ver expresiones y propiedades completas? (s/N): ').strip().lower() == 's':
+        pretty([item['instruction'] for item in plan])
+    if any(item['operation'] != 'Execute' for item in plan):
+        print('Guarda copia del PBIX. No hay transaccion global ni reversion automatica; los cambios completados pueden permanecer.')
+    if any(item['operation'] == 'Delete' for item in plan):
+        print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
+    if input('Escribe CONFIRMAR para ejecutar el bloque completo: ').strip() != 'CONFIRMAR':
+        print('Cancelado')
+        return []
+    return execute_ai_plan(client, plan)
+
+
 def advanced(client):
     print('\nHerramientas disponibles:')
     for name in client.tools:
@@ -987,6 +1333,7 @@ def main():
             print('10. Consultar relaciones')
             print('11. Ejecutar consulta DAX')
             print('12. Herramienta avanzada')
+            print('13. Ejecutar bloque de instrucciones de IA')
             print('0. Salir')
             choice = input('Opcion: ').strip()
             if choice == '0':
@@ -1010,6 +1357,8 @@ def main():
                     dax_query(client)
                 elif choice == '12':
                     advanced(client)
+                elif choice == '13':
+                    ai_block(client)
                 else:
                     print('Opcion invalida')
             except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
@@ -1028,3 +1377,4 @@ if __name__ == '__main__':
     except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
         print('ERROR:', exc)
         sys.exit(1)
+
