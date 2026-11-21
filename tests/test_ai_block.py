@@ -2,6 +2,8 @@ import contextlib
 import copy
 import io
 import json
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -51,6 +53,8 @@ class ModelClient(FakeClient):
                     return {'isError': True, 'content': [{'type': 'text', 'text': 'Object not found'}]}
                 rows.append(copy.deepcopy(catalog[key]))
             return {'data': rows}
+        if op == 'ExportTMDL':
+            return {'data': {'tmdl': 'measure Test = 1'}}
         objects = req.get('definitions', req.get('references'))
         for obj in objects:
             if obj['name'] == self.fail_name:
@@ -79,12 +83,15 @@ def measure(action='create_measure', name='Nueva', table='Ventas', expression='1
 class BlockTests(unittest.TestCase):
     def setUp(self):
         self.client = ModelClient()
+        self.backup_temp = tempfile.TemporaryDirectory()
+        self.client.backup_dir = Path(self.backup_temp.name)
         self.output = io.StringIO()
         self.context = contextlib.redirect_stdout(self.output)
         self.context.__enter__()
 
     def tearDown(self):
         self.context.__exit__(None, None, None)
+        self.backup_temp.cleanup()
 
     def plan(self, ops):
         parsed = c.parse_ai_block(json.dumps({'operations': ops}))
@@ -211,11 +218,12 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(sum('CONFIRMAR' in str(call) for call in inp.call_args_list), 1)
         self.assertIn('Modelo de destino: Prueba', self.output.getvalue())
 
-    def test_failure_stops_remainder_preserves_previous(self):
+    def test_failure_stops_remainder_and_restores_previous(self):
         self.client.fail_name = 'Mala'
         result = c.execute_ai_plan(self.client, self.plan([measure(), measure(name='Mala'), measure(name='NoEnviada')]))
         self.assertEqual([r['status'] for r in result], ['correcta', 'fallida'])
-        self.assertIn(('Ventas', 'Nueva'), self.client.catalog['measure_operations'])
+        self.assertNotIn(('Ventas', 'Nueva'), self.client.catalog['measure_operations'])
+        self.assertEqual(self.client.last_recovery, 'verificada')
         self.assertNotIn(('Ventas', 'NoEnviada'), self.client.catalog['measure_operations'])
         self.assertIn('No ejecutadas: 1', self.output.getvalue())
 
