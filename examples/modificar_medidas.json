@@ -1,0 +1,6 @@
+{
+  "operations": [
+    {"action": "update_measure", "table": "Medidas", "name": "TEST_MCP_001", "expression": "5", "formatString": "0"},
+    {"action": "update_measure", "table": "Medidas", "name": "TEST_MCP_002", "description": "Descripcion actualizada", "displayFolder": "Pruebas"}
+  ]
+}
