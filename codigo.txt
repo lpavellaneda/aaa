@@ -1191,9 +1191,15 @@
 4|pattern = re.compile(r'"(?:[^"]|"")*"|//[^\n]*|--[^\n]*|/\*.*?\*/|'
 25|r"(?:(?:'((?:[^']|'')+)'|([\w]+))\s*)?\[((?:[^\]]|\]\])+?)\]", re.DOTALL)
 4|refs = set()
+4|keywords = {'return', 'var', 'not', 'in', 'and', 'or', 'evaluate', 'define',
+16|'measure', 'column', 'table', 'by', 'asc', 'desc', 'true', 'false'}
 4|for match in pattern.finditer(expression):
 8|if match.group(3) is not None:
 12|table = match.group(1) or match.group(2)
+12|# RETURN [Measure] is not an unquoted table called RETURN. A quoted
+12|# table with that name ('RETURN'[Column]) remains a qualified reference.
+12|if match.group(1) is None and table and table.casefold() in keywords:
+16|table = None
 12|refs.add((table.replace("''", "'").casefold() if table else None,
 22|match.group(3).replace(']]', ']').casefold()))
 4|return refs
@@ -1561,6 +1567,8 @@
 16|before_error = target['before'].get('errorMessage') or 'error' in str(target['before'].get('state', '')).casefold()
 16|if not before_error:
 20|check_semantic_state(current)
+20|if target['tool'] == 'column_operations' and calculated_column(target['before']):
+24|verify_column_storage(client, target['reference'])
 8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
 12|differences.append(target['reference']['name'] + ': no se pudo verificar: ' + str(exc))
 4|return differences
@@ -1646,6 +1654,14 @@
 20|request_call(client, tool, operation, **fields)
 12|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
 16|recovery_errors.append(ref['name'] + ': ' + str(exc))
+8|restored_columns = [{'tool': target['tool'], 'operation': 'Update',
+29|'instruction': {'table': target['reference']['tableName'], 'name': target['reference']['name']}}
+28|for target in backup['targets'] if target['tool'] == 'column_operations' and target['before'] is not None]
+8|if restored_columns:
+12|try:
+16|calculate_plan_columns(client, restored_columns)
+12|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+16|recovery_errors.append('Recalculo despues de restaurar columnas: ' + str(exc))
 4|else:
 8|recovery_errors.append('No se puede restaurar con certeza la conexion original')
 4|differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; verificacion pendiente']
@@ -1681,6 +1697,77 @@
 8|client._block_active = previous_block
 0|
 0|
+0|class BlockOperationError(RuntimeError):
+4|def __init__(self, index, reference, message):
+8|self.operation_index = index
+8|super().__init__(f'Operacion {index}, {reference["tableName"]}[{reference["name"]}]: {message}')
+0|
+0|
+0|def dax_column_reference(table, column):
+4|return "'" + table.replace("'", "''") + "'[" + column.replace(']', ']]') + ']'
+0|
+0|
+0|def verify_column_storage(client, reference):
+4|query = 'EVALUATE ROW("__MCP_ColumnReady", COUNTROWS(VALUES(' + dax_column_reference(reference['tableName'], reference['name']) + ')))'
+4|fields = ai_query_fields(client, {'query': query, 'maxRows': 1})
+4|dax_rows(request_call(client, 'dax_query_operations', 'Execute', **fields))
+0|
+0|
+0|def calculate_plan_columns(client, plan):
+4|"""Calculate storage, then query the engine; metadata alone is insufficient."""
+4|columns = {}
+4|for index, item in enumerate(plan, 1):
+8|if item['tool'] != 'column_operations':
+12|continue
+8|op = item['instruction']
+8|key = (op['table'], op['name'])
+8|if item['operation'] == 'Delete':
+12|columns.pop(key, None)
+8|else:
+12|columns[key] = index
+4|tables = list(dict.fromkeys(table for table, _ in columns))
+4|for table in tables:
+8|ref = next({'tableName': t, 'name': name} for t, name in columns if t == table)
+8|index = columns[table, ref['name']]
+8|try:
+12|if not operation_supported(client, 'table_operations', 'RefreshWithXMLA'):
+16|raise RuntimeError('El servidor no ofrece RefreshWithXMLA para calcular las columnas')
+12|print('Calculando columnas de:', table)
+12|request_call(client, 'table_operations', 'RefreshWithXMLA', references=[{'name': table}], refreshType='Calculate')
+8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+12|# A table-level Calculate error may actually belong to another new
+12|# column in that table. Inspect all affected columns before naming it.
+12|for (target_table, name), affected_index in columns.items():
+16|if target_table != table or not client.connection_name:
+20|continue
+16|candidate_ref = {'tableName': table, 'name': name}
+16|try:
+20|state = get_object(client, 'column_operations', candidate_ref)
+16|except (RuntimeError, ValueError, TimeoutError, OSError):
+20|continue
+16|try:
+20|check_semantic_state(state)
+16|except RuntimeError as semantic:
+20|raise BlockOperationError(affected_index, candidate_ref, str(semantic)) from exc
+12|raise BlockOperationError(index, ref, 'No se pudo calcular la tabla: ' + str(exc)) from exc
+8|for (target_table, name), index in columns.items():
+12|if target_table != table:
+16|continue
+12|ref = {'tableName': table, 'name': name}
+12|try:
+16|verify_column_storage(client, ref)
+16|check_semantic_state(get_object(client, 'column_operations', ref))
+12|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+16|raise BlockOperationError(index, ref, 'La columna no puede evaluarse despues del recalculo: ' + str(exc)) from exc
+4|return tables
+0|
+0|
+0|def target_operation_index(plan, target):
+4|return max(i for i, item in enumerate(plan, 1) if item['tool'] == target['tool'] and
+15|item['instruction'].get('table') == target['reference']['tableName'] and
+15|item['instruction'].get('name') == target['reference']['name'])
+0|
+0|
 0|def _execute_ai_plan(client, plan):
 4|"""Back up first; use server transaction when available, otherwise compensate."""
 4|identity = selected_target(client)
@@ -1711,6 +1798,7 @@
 12|print('El bloque contiene consultas DAX: se usa compensacion para que vean los cambios ya aplicados; el servidor DAX utiliza otra sesion.')
 4|results = []
 4|failed = False
+4|pending_columns = False
 4|for index, item in enumerate(plan, 1):
 8|op, tool, operation = item['instruction'], item['tool'], item['operation']
 8|try:
@@ -1721,6 +1809,9 @@
 12|if tx and getattr(client, 'mcp_session_token', None) != mcp_session:
 16|raise ConnectionIdentityError('La sesion MCP cambio durante la transaccion; operacion no enviada')
 12|fields = dict(item['fields'])
+12|if operation == 'Execute' and pending_columns:
+16|backup['calculatedTables'] = calculate_plan_columns(client, plan[:index-1])
+16|pending_columns = False
 12|if operation != 'Execute':
 16|ref = object_reference(ai_object(op))
 16|backup['journal'].append({'index': index, 'tool': tool, 'operation': operation, 'reference': ref,
@@ -1729,6 +1820,8 @@
 16|save_recovery_file(path, backup)
 16|if tx and 'options' in fields:
 20|fields['options'] = dict(fields['options'], useTransaction=False)
+12|if tool == 'column_operations':
+16|pending_columns = True
 12|value = request_call(client, tool, operation, **fields)
 12|if tool == 'dax_query_operations':
 16|rows = dax_rows(value)
@@ -1757,9 +1850,22 @@
 12|transaction_request(client, 'Commit', tx)
 12|backup['transactionClosed'] = True
 12|client.active_transaction = None
+12|if pending_columns:
+16|# Do not let a table-level refresh obscure an invalid measure or
+16|# column that the engine can already identify after Commit.
+16|for target, _ in final:
+20|try:
+24|check_semantic_state(target_state(client, target['tool'], target['reference']))
+20|except RuntimeError as exc:
+24|raise BlockOperationError(target_operation_index(plan, target), target['reference'], str(exc)) from exc
+16|backup['calculatedTables'] = calculate_plan_columns(client, plan)
+16|pending_columns = False
 12|for target, expected in final:
 16|current = target_state(client, target['tool'], target['reference'])
-16|check_semantic_state(current)
+16|try:
+20|check_semantic_state(current)
+16|except RuntimeError as exc:
+20|raise BlockOperationError(target_operation_index(plan, target), target['reference'], str(exc)) from exc
 16|# SaveChanges/Commit resolves inferred types. Compare requested types
 16|# exactly, but do not mistake normal inference for a failed commit.
 16|explicit_type = any(item['tool'] == target['tool'] and
@@ -1771,11 +1877,28 @@
 20|current.pop('dataType', None)
 20|expected.pop('dataType', None)
 16|if stable_state(current) != stable_state(expected):
-20|raise RuntimeError('El estado despues de Commit no coincide con el esperado')
+20|raise BlockOperationError(target_operation_index(plan, target), target['reference'], 'El estado despues de Commit no coincide con el esperado')
 8|except (ValueError, RuntimeError, TimeoutError, OSError, KeyboardInterrupt) as exc:
 12|failed = True
 12|backup['commitError'] = str(exc)
+12|if isinstance(exc, BlockOperationError):
+16|backup['failedOperationIndex'] = exc.operation_index
+16|for row in results:
+20|if row['index'] == exc.operation_index:
+24|row.update(status='fallida', error=str(exc))
 12|print('ERROR AL CONFIRMAR LA TRANSACCION:', exc)
+4|if not failed and not tx and pending_columns:
+8|try:
+12|backup['calculatedTables'] = calculate_plan_columns(client, plan)
+8|except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
+12|failed = True
+12|backup['calculationError'] = str(exc)
+12|if isinstance(exc, BlockOperationError):
+16|backup['failedOperationIndex'] = exc.operation_index
+16|for row in results:
+20|if row['index'] == exc.operation_index:
+24|row.update(status='fallida', error=str(exc))
+12|print('ERROR AL CALCULAR COLUMNAS:', exc)
 4|if writes:
 8|backup['results'] = results
 8|backup['connectionDiagnostics'] = list(getattr(client, 'connection_events', []))
@@ -1794,7 +1917,8 @@
 4|print('\nRESULTADO FINAL')
 4|print('Verificadas antes de recuperacion:' if writes and failed else 'Correctas:',
 10|sum(r['status'] == 'correcta' for r in results))
-4|print('Fallidas:', sum(r['status'] == 'fallida' for r in results) + int(bool(backup and backup.get('commitError'))))
+4|print('Fallidas:', sum(r['status'] == 'fallida' for r in results) +
+10|int(bool(backup and backup.get('commitError') and not backup.get('failedOperationIndex'))))
 4|print('No ejecutadas:', skipped)
 4|print('Estado final del bloque:', client.last_block_status)
 4|if writes and failed:
