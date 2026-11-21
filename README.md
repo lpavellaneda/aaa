@@ -1,0 +1,375 @@
+# Cliente Python para Power BI Desktop
+
+Cliente de consola refactorizado a partir de `cliente_powerbi.py`, con Python 3.12
+y exclusivamente su biblioteca estándar. No utiliza Node.js, npm, pip ni servicios
+de IA para funcionar. Necesita el servidor MCP de Microsoft instalado por separado.
+
+## Inicio rápido en Windows 11
+
+1. Extrae todos los archivos en una carpeta autorizada.
+2. Abre un PBIX en Power BI Desktop y comprueba que está instalada la extensión
+   **Power BI Authoring MCP Server** en Visual Studio Code.
+3. Abre PowerShell en la carpeta que contiene `cliente.py`.
+4. Si has revisado y aceptado la licencia del servidor, configura su aceptación
+   para esa sesión y ejecuta el cliente:
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python cliente.py
+```
+
+La variable se hereda en el proceso del servidor. El cliente no la establece
+automáticamente ni añade opciones para aceptar la licencia por su cuenta.
+
+Elige el modelo por número. `2` lista tablas directamente; `3` lista medidas con
+su tabla; `10` consulta relaciones; `11` ejecuta consultas DAX.
+
+Para edición:
+
+```powershell
+python cliente.py --write
+```
+
+El programa pide `EDITAR` al iniciar. Guarda una copia del PBIX. Cada lote muestra
+la vista previa y requiere escribir exactamente `CONFIRMAR`. Los lotes se envían
+objeto por objeto: no constituyen una transacción global. Se informa el resultado
+individual y se conservan los cambios que ya fueron confirmados si otro falla.
+El servidor puede solicitar además su propio consentimiento.
+
+La detección busca las carpetas de extensiones de VS Code en el perfil del usuario
+y ordena las versiones numéricamente. No contiene un puerto ni una ruta personal
+fijos. Si la instalación corporativa usa otra ubicación autorizada:
+
+```powershell
+python cliente.py --server "D:\Herramientas\PowerBI\powerbi-modeling-mcp.exe"
+```
+
+## Uso de los menús
+
+| Opción | Comportamiento |
+| --- | --- |
+| 1 | Detectar instancias y cambiar el modelo activo |
+| 2 | Listar tablas; opcionalmente seleccionar una para ver su estructura |
+| 3 | Listar medidas; seleccionar por número para ver DAX, descripción y carpeta |
+| 4 / 7 | Crear una o varias medidas / columnas calculadas, seleccionando tablas |
+| 5 / 8 | Seleccionar objetos, ver sus expresiones y preparar cambios con diferencias |
+| 6 / 9 | Seleccionar objetos con `1,3`; confirmar eliminación sin cascada |
+| 10 | Mostrar relaciones y solo los atributos devueltos por el servidor |
+| 11 | Introducir DAX multilínea y opcionalmente guardar resultados en CSV |
+| 12 | Inspeccionar herramientas, esquemas y respuestas completas; ejecutar JSON avanzado |
+| 13 | Pegar y ejecutar un bloque JSON de instrucciones generado por IA |
+| 0 | Cerrar el cliente y su proceso MCP |
+
+En la lista de medidas, `/Ventas` filtra por nombre o tabla; `/` recupera toda la
+lista. El filtro no distingue mayúsculas. Enter permite regresar.
+
+Las expresiones y consultas terminan con una línea que contenga `FIN`. Al editar,
+`FIN` sin expresión conserva la existente. En descripción, carpeta y formato,
+Enter conserva el valor y `/vaciar` lo borra. No se cambia la tabla asignada a una
+medida mediante Update. Las opciones normales de columnas solo modifican o
+eliminan columnas calculadas DAX cuyo tipo pueda confirmarse; omiten columnas
+importadas, de tablas calculadas y de tipo desconocido.
+
+La opción DAX utiliza exclusivamente `dax_query_operations.Execute` y pide
+resultados `Inline` cuando el esquema lo admite. Devuelve hasta 1000 filas y
+advierte si se alcanza ese límite. El CSV conserva los valores completos; la
+pantalla limita cada celda a 60 caracteres. No sobrescribe archivos existentes.
+
+La opción avanzada conserva el ingreso manual de JSON del cliente original.
+Sus operaciones de modelo usan explícitamente la conexión activa y rechazan un
+identificador diferente. Una operación avanzada que cambie conexiones invalida
+la selección del menú y obliga a elegir nuevamente el modelo.
+
+## Opción 13: ejecutar un bloque generado por IA
+
+La IA solo prepara el JSON. El cliente no llama a ChatGPT, Codex ni a otro servicio
+para ejecutar el bloque. Se mantienen las opciones 1 a 12 y su transporte MCP.
+
+1. Inicia con `python cliente.py --write` si habrá cambios; escribe `EDITAR`.
+2. Selecciona el modelo por número. Ese será el único destino del bloque.
+3. Selecciona `13`, pega el JSON y escribe `FIN` en una línea independiente.
+4. El programa valida todo el bloque sin enviar escrituras. Si alguna instrucción
+   es inválida, lo rechaza completo e informa el problema.
+5. Revisa el modelo, el resumen y la lista completa de objetos en orden. Responde
+   `s` si quieres ver también todas las expresiones y propiedades.
+6. Escribe exactamente `CONFIRMAR` una sola vez para ejecutar el bloque. Una
+   eliminación usa esta misma confirmación explícita y muestra una advertencia
+   sobre dependencias. El servidor puede solicitar además su propio consentimiento.
+
+Ejemplo individual:
+
+```json
+{"action":"create_measure","table":"Medidas","name":"Prueba","expression":"1 + 1"}
+```
+
+Ejemplo mixto, con orden explícito:
+
+```json
+{
+  "operations": [
+    {"action":"create_measure","table":"Medidas","name":"Prueba","expression":"1"},
+    {"action":"update_measure","table":"Medidas","name":"Prueba","expression":"2"},
+    {"action":"execute_dax","query":"EVALUATE ROW(\"Valor\", [Prueba])"},
+    {"action":"delete_measure","table":"Medidas","name":"Prueba"}
+  ]
+}
+```
+
+**Medidas es un nombre ilustrativo**: sustituye las tablas y los nombres por los
+de tu modelo. Crear exige que el nombre no exista; modificar y eliminar exigen
+que el objeto exista en ese punto de la secuencia. Un objeto creado al principio
+puede modificarse y eliminarse después en el mismo bloque.
+
+### Acciones permitidas
+
+| action | Campos obligatorios adicionales | Opcionales |
+| --- | --- | --- |
+| `create_measure` / `create_column` | `table`, `name`, `expression` | Propiedades compatibles |
+| `update_measure` / `update_column` | `table`, `name` y al menos una propiedad modificable | `expression` y propiedades compatibles |
+| `delete_measure` / `delete_column` | `table`, `name` | Ninguno |
+| `delete_measures` | `table`, `names` (lista no vacía) | Ninguno |
+| `execute_dax` | `query` | `maxRows`, entre 1 y 100000; predeterminado 1000 |
+
+Las propiedades de creación/actualización admitidas por este formato son
+`description`, `displayFolder`, `formatString`, `isHidden` (booleano) y `dataType`.
+Se comprueba además que el esquema real permita cada propiedad. `dataType` puede
+tener restricciones del servidor para ciertas medidas o columnas. Una cadena
+vacía en descripción, carpeta o formato solicita borrar el valor. No se admiten
+propiedades ni acciones ajenas a esta lista; el formato no permite ejecutar código
+Python, PowerShell, comandos del sistema ni solicitudes MCP arbitrarias.
+
+No se requieren ni se aceptan `model`, `version`, `connectionName` ni cadenas de
+conexión en el JSON. La conexión se toma del estado del cliente. El bloque puede
+ser una operación individual o un objeto con solo `operations`. También puedes
+colocar `delete_measures` dentro de `operations`; se expande en el lugar indicado,
+respetando el orden de `names`:
+
+```json
+{"action":"delete_measures","table":"Medidas","names":["Medida B","Medida A"]}
+```
+
+Para tablas diferentes, incluye una operación por tabla o varios `delete_measures`.
+No hay búsqueda parcial, coincidencias por prefijo ni expansión de comodines.
+
+### Validación, dependencias y errores
+
+- El catálogo virtual reproduce el orden indicado, valida tablas y objetos,
+  nombres de medidas únicos en el modelo, columnas calculadas compatibles,
+  campos y esquemas de tools/list. Las eliminaciones desactivan la cascada.
+- Se rechazan instrucciones idénticas, dos acciones iguales sobre el mismo objeto,
+  actualizaciones sin cambios especificados y recreaciones tras eliminar el mismo
+  objeto. Una secuencia crear, modificar y eliminar sí está permitida y se avisa.
+- Se buscan posibles referencias DAX entre objetos, referencias a objetos creados
+  después o eliminados antes y ciclos entre medidas. Antes de eliminar, se leen
+  expresiones existentes; una dependencia detectada exige modificar o eliminar
+  primero al dependiente. Para columnas se comprueban también las relaciones.
+- El análisis es léxico y conservador, no un compilador DAX. Puede advertir o
+  bloquear referencias ambiguas y no cubre todas las dependencias de visuales,
+  grupos de cálculo, metadatos o consultas. Los detalles de columnas sin tabla y
+  nombres repetidos pueden dejar el análisis parcial; se informa. El servidor
+  mantiene la validación definitiva de las expresiones y de las dependencias.
+- No se reordenan instrucciones ni se envía un lote parcialmente válido. La
+  validación de un modelo que cambie simultáneamente desde otra aplicación puede
+  quedar desactualizada: revisa ese caso y no ejecutes cambios concurrentes.
+- Tras cada escritura se consulta el modelo con List/Get para verificar el estado,
+  incluso si el servidor devuelve contenido vacío. No se anuncia éxito por el solo
+  hecho de haber enviado una solicitud.
+- Al primer fallo, resultado incierto o pérdida de conexión, el lote se detiene.
+  El resumen distingue correctas, fallidas y no ejecutadas. No hay reintentos
+  automáticos, transacción global ni rollback: los cambios anteriores pueden
+  permanecer. Revisa el estado antes de generar un bloque de corrección.
+
+No hay límite de cinco, diez ni cien operaciones. Una prueba simulada ejecuta
+300 operaciones. El tamaño práctico depende de memoria, tiempos del servidor y
+del modelo. El inventario usa el límite de 100000 objetos del cliente existente y
+advierte al alcanzarlo; no se garantiza inventario completo por encima de ese
+valor. La lista de acciones solo se ampliará cuando se comprueben las herramientas
+y esquemas necesarios; no hay creación o eliminación de tablas o relaciones en
+esta versión del formato.
+
+### Ejemplos listos para adaptar
+
+- `examples/crear_medidas.json`: dos medidas; la segunda depende de la primera.
+- `examples/modificar_medidas.json`: modificación de expresiones y propiedades.
+- `examples/eliminar_medidas.json`: eliminación abreviada, dependiente primero.
+- `examples/bloque_mixto.json`: crear, modificar, consultar y eliminar.
+- `examples/columnas_calculadas.json`: ciclo completo de columnas DAX.
+
+Copia el contenido de un archivo, no su ruta, en la opción 13. Termina con FIN.
+Para pedirle un bloque a una IA puedes usar:
+
+> Genera solo JSON para mi opción 13. Usa operations y estas acciones:
+> create_measure, update_measure, delete_measure, delete_measures, create_column,
+> update_column, delete_column y execute_dax. No incluyas model, version ni
+> connectionName. Conserva el orden de dependencias y usa únicamente estas tablas,
+> medidas y columnas existentes: [pega aquí sus nombres]. Estas son mis instrucciones:
+> [describe aquí los cambios].
+
+### Comprobación de esta modificación
+
+```powershell
+python -m unittest discover -s tests -v
+python codificar.py cliente.py codigo.txt
+```
+
+Pasaron **84 pruebas automatizadas**, incluidas las 51 de regresión del cliente
+anterior y 33 nuevas para bloques. Se cubren creación individual, 300 creaciones,
+modificaciones y eliminaciones múltiples, mezcla de acciones, tablas diferentes,
+JSON inválido y claves duplicadas, listas permitidas, conflictos, conexiones,
+confirmación única, dependencias, columnas importadas, respuestas MCP vacías,
+fallos parciales y tiempos de espera.
+
+También se ejecutó realmente en `BI` un bloque de **11 operaciones: 10 escrituras
+y una consulta DAX**. Se crearon dos medidas y dos columnas temporales, se
+modificaron una medida y una columna y se eliminaron los cuatro objetos. La
+consulta intermedia devolvió 10 y 11 para las medidas relacionadas. Todas las
+escrituras se verificaron por lectura y el inventario final coincidió con el
+inicial. Los objetos temporales quedaron eliminados. No se guardó ni reabrió el
+PBIX. El consentimiento interactivo adicional del servidor sigue cubierto por
+simulaciones; no se solicitó durante esta prueba real.
+
+Para repetir **solo si autorizas nuevas escrituras temporales**:
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python tests/live_ai_block.py --modelo "BI" --confirmar-escrituras
+```
+
+El script registra un informe local `resultado_bloque_ia.json`, que no se incluye
+en el control de versiones. Las pruebas normales unittest nunca escriben en un
+modelo real. El generador de código codificado y su decodificador se conservan;
+`codigo.txt` se regenera a partir del cliente actualizado y es reversible byte a byte.
+
+
+## Cambios respecto del archivo original
+
+Se mantuvieron `MCP`, subprocess con stdin/stdout, lectura con hilos y cola,
+initialize, tools/list, tools/call, detección de instancias, selección numérica,
+conexión con la cadena detectada, menú de 12 opciones y modo avanzado. También
+se conservan `field_value`, `collect_fields`, `pretty`, `tool_schema` y los puntos
+de entrada de los menús. No se sustituyó el transporte por otro proyecto.
+
+Los cambios principales son:
+
+- Las consultas normales construyen sus solicitudes sin formularios de esquema.
+- Connect nunca recibe el identificador de la conexión anterior y acepta tanto
+  `data: "identificador"` como un objeto con `connectionName`.
+- Se preserva `tableName` cuando List agrupa medidas o columnas por tabla. Este
+  formato se observó en el servidor real y es necesario para Get y la edición.
+- Se usan `definitions` para Create/Update y `references` para Get/Delete,
+  comprobando las propiedades del esquema descubierto. Se resuelven referencias
+  JSON locales y envoltorios anulables compatibles. Si un formato nuevo es ambiguo,
+  se informa en lugar de adivinarlo.
+- tools/list admite paginación. Las operaciones se contrastan con enum o con la
+  descripción declarada por el servidor. Los filtros solicitan hasta 100000 objetos;
+  alcanzar el límite provoca una advertencia.
+- La identidad de la conexión se comprueba antes de operar, incluyendo puerto,
+  título y, si están disponibles, proceso y hora de inicio. No se reconecta ni se
+  reintenta una escritura automáticamente tras una respuesta incierta.
+- Se bloquean escrituras en el cliente y se inicia el servidor con `--readonly`
+  por defecto. También se aplica el bloqueo al modo avanzado.
+- Se interpretan errores MCP, contenido JSON anidado, contenido estructurado y
+  recursos de texto embebidos. Si una escritura devuelve contenido vacío o carece
+  de confirmación explícita, se consulta List/Get para verificar su estado real:
+  propiedades guardadas para Create/Update y ausencia para Delete. No se anuncia
+  éxito si esa comprobación falla.
+- El plazo de espera es absoluto y no se reinicia por notificaciones. Se responden
+  ping y solicitudes estándar de consentimiento `elicitation/create`; estas últimas
+  requieren aprobación interactiva. Se cierra el proceso incluso si falla el inicio.
+- Los mensajes rutinarios `IsError=False` no ensucian la consola. `--debug` muestra
+  las respuestas completas y la salida de diagnóstico del servidor.
+
+Las validaciones locales cubren el subconjunto de JSON Schema necesario para las
+solicitudes generadas; el servidor sigue siendo la autoridad para las reglas de
+negocio, las expresiones DAX y los cambios de modelo. No es un validador general
+de todas las variantes posibles de JSON Schema.
+
+## Transferencia con indentación reversible
+
+Usa únicamente canales de transferencia autorizados por tu organización.
+
+```powershell
+python codificar.py cliente.py codigo.txt
+python decodificar.py codigo.txt cliente_reconstruido.py
+```
+
+Cada línea usa `numero_de_espacios|contenido`. Se trabaja en bytes UTF-8, sin
+normalizar LF, CRLF, BOM, tabuladores, líneas vacías, espacios finales ni la
+ausencia del salto final. Solo los espacios iniciales se reemplazan por el número;
+los tabuladores permanecen literales. El texto deja de ser reversible si el canal
+de transferencia altera esos bytes. `decodificar.py` rechaza formatos inválidos y
+no sobrescribe archivos salvo que añadas `--sobrescribir`.
+
+Comprobación byte a byte en PowerShell:
+
+```powershell
+(Get-FileHash cliente.py).Hash -eq (Get-FileHash cliente_reconstruido.py).Hash
+```
+
+## Pruebas y resultados del 21 de noviembre de 2026
+
+Pruebas automatizadas sin Power BI ni dependencias externas:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Las 51 pruebas de la suite pasaron. Simulan selección y cambio de modelos, respuestas de conexión en ambos
+formatos, conexiones cerradas y puertos reutilizados, lectura, filtros, estructuras
+MCP anidadas, solicitudes con los esquemas reales, escritura bloqueada,
+confirmaciones, edición y eliminación múltiple, errores parciales, plazos,
+consentimiento, columnas calculadas/importadas, CSV y transferencia byte a byte.
+`tests/tool_schemas.json` contiene seis esquemas capturados de tools/list del
+servidor instalado 1.0.1; las respuestas del modelo usadas por unittest son sintéticas.
+
+Prueba real opcional que solo consulta el modelo:
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python tests/live_powerbi.py --modelo "Titulo del modelo"
+```
+
+Se ejecutó realmente con Python 3.12.10, servidor 1.0.1 y el modelo abierto `BI`:
+detección de instancia, Connect, GetConnection, 9 tablas, 58 medidas, 100 columnas,
+8 relaciones, Get de tabla/medida/columna, visualización de los menús de lectura,
+una consulta `EVALUATE ROW("PruebaCliente", 1)` y detección de un error DAX deliberado.
+En una prueba posterior, autorizada expresamente sobre el mismo modelo `BI`, se
+comprobaron realmente Create, Update y Delete de dos medidas y dos columnas
+calculadas temporales en la tabla `Selector Escenario`: 12 escrituras verificadas
+mediante lectura posterior. Update cambió expresiones y descripciones. Se
+eliminaron todos los objetos temporales y se comprobó que los inventarios de
+medidas, columnas y tablas, y las relaciones, coincidían con los iniciales.
+
+Esta prueba detectó que el servidor 1.0.1 puede responder a escrituras con
+`content: []` e `isError: false` aunque sí aplique el cambio. El cliente ahora
+verifica el resultado mediante List/Get antes de anunciar éxito. El primer
+intento detectó esa respuesta ambigua, se detuvo y limpió sus medidas temporales;
+la ejecución completa posterior validó ambas clases de objetos. No se guardó ni
+reabrió el PBIX: la persistencia en disco queda pendiente de validación. La
+interacción de consentimiento se cubre con simulaciones; el servidor no la pidió
+durante estas escrituras reales.
+
+El informe de la ejecución completa está en `resultado_escrituras.json`.
+El script de escritura es **opcional** y solo se ejecuta con autorización explícita:
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python tests/live_write_powerbi.py --modelo "BI" --confirmar-escrituras
+```
+
+El script crea nombres únicos, comprueba cada cambio, elimina sus objetos y
+registra la limpieza incluso si falla una etapa. El argumento autoriza los
+objetos temporales y los consentimientos del servidor que correspondan a esa
+prueba. No se prometen operaciones compatibles con todas las versiones futuras.
+
+## Documentación oficial consultada
+
+- [Repositorio y documentación de Microsoft](https://github.com/microsoft/powerbi-modeling-mcp):
+  herramientas, modos de acceso, aceptación de licencia y limitaciones. El
+  repositorio público consultado distribuye documentación y binarios; los detalles
+  de los esquemas se comprobaron directamente mediante tools/list del ejecutable.
+- [Especificación MCP: consentimiento interactivo](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation).
+
+El servidor respeta permisos y restricciones de Power BI. Sus operaciones siguen
+las reglas de herramientas externas, y puede solicitar consentimiento adicional.
+No se cambian políticas corporativas ni se instalan componentes por el cliente.
