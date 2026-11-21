@@ -203,19 +203,21 @@ class BlockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'conexion'):
             self.plan([measure()])
 
-    def test_delete_needs_exact_confirmation(self):
-        lines = [json.dumps(measure('delete_measure', 'Base')), 'FIN', 'n', 's']
-        with patch('builtins.input', side_effect=lines):
+    def test_write_authorizes_deletion_without_confirmation(self):
+        lines = [json.dumps(measure('delete_measure', 'Base')), 'FIN']
+        with patch('builtins.input', side_effect=lines) as inp:
             result = c.ai_block(self.client)
-        self.assertEqual(result, [])
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(result[0]['status'], 'correcta')
+        self.assertEqual(inp.call_count, 2)
+        self.assertNotIn(('Ventas', 'Base'), self.client.catalog['measure_operations'])
 
-    def test_one_confirmation_for_whole_block(self):
+    def test_no_confirmation_for_whole_block(self):
         ops = [measure(), measure('update_measure', expression='3'), measure('delete_measure')]
-        with patch('builtins.input', side_effect=[json.dumps({'operations': ops}), 'FIN', 'n', 'CONFIRMAR']) as inp:
+        with patch('builtins.input', side_effect=[json.dumps({'operations': ops}), 'FIN']) as inp:
             results = c.ai_block(self.client)
         self.assertEqual(len(results), 3)
-        self.assertEqual(sum('CONFIRMAR' in str(call) for call in inp.call_args_list), 1)
+        self.assertEqual(inp.call_count, 2)
+        self.assertEqual(sum('CONFIRMAR' in str(call) for call in inp.call_args_list), 0)
         self.assertIn('Modelo de destino: Prueba', self.output.getvalue())
 
     def test_failure_stops_remainder_and_restores_previous(self):
