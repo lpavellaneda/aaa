@@ -1,0 +1,1380 @@
+0|import argparse
+0|import csv
+0|import difflib
+0|import json
+0|import time
+0|import queue
+0|import re
+0|import subprocess
+0|import sys
+0|import threading
+0|from pathlib import Path
+0|
+0|EXTENSIONS = Path.home() / '.vscode' / 'extensions'
+0|MATCHES = sorted(
+4|[p for pattern in ('analysis-services.powerbi-modeling-mcp-*-win32-x64/server/powerbi-modeling-mcp.exe',
+23|'microsoft.powerbi-modeling-mcp-*-win32-x64/server/powerbi-modeling-mcp.exe')
+5|for p in EXTENSIONS.glob(pattern)],
+4|key=lambda p: tuple(int(n) for n in re.findall(r'\d+', p.parent.parent.name)), reverse=True)
+0|SERVER = MATCHES[0] if MATCHES else None
+0|
+0|class MCP:
+4|def __init__(self, writable=False, server=None, debug=False):
+8|self.writable = writable
+8|self.debug = debug
+8|server = Path(server) if server else SERVER
+8|if not server or not server.is_file():
+12|raise RuntimeError('No se encontro powerbi-modeling-mcp.exe en VS Code')
+8|args = [str(server), '--start', '--readwrite' if writable else '--readonly']
+8|self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+40|stderr=subprocess.PIPE, text=True, encoding='utf-8',
+40|errors='replace', bufsize=1)
+8|self.inbox = queue.Queue()
+8|self.counter = 0
+8|self.connection_name = None
+8|self.instance = None
+8|self.model_name = None
+8|threading.Thread(target=self._read, daemon=True).start()
+8|threading.Thread(target=self._stderr, daemon=True).start()
+8|try:
+12|self._initialize()
+8|except BaseException:
+12|self.close()
+12|raise
+0|
+4|def _initialize(self):
+8|self.call('initialize', {'protocolVersion': '2025-06-18',
+33|'capabilities': {'elicitation': {}},
+33|'clientInfo': {'name': 'powerbi-python-menu', 'version': '3.0'}})
+8|self.notify('notifications/initialized')
+8|self.tools = {}
+8|cursor = None
+8|seen = set()
+8|while True:
+12|page = self.call('tools/list', {'cursor': cursor} if cursor else {})
+12|self.tools.update({t['name']: t for t in page.get('tools', [])})
+12|cursor = page.get('nextCursor')
+12|if not cursor:
+16|break
+12|if cursor in seen:
+16|raise RuntimeError('Paginacion MCP repetida')
+12|seen.add(cursor)
+0|
+4|def _read(self):
+8|for line in self.process.stdout:
+12|try:
+16|msg = json.loads(line)
+16|if isinstance(msg, dict):
+20|self.inbox.put(msg)
+12|except json.JSONDecodeError:
+16|pass
+8|self.inbox.put({'_closed': True})
+0|
+4|def _stderr(self):
+8|for line in self.process.stderr:
+12|if self.debug or re.search(r'\b(error|exception|failed|failure|fail)\b|IsError\s*[=:]\s*True', line, re.IGNORECASE):
+16|print('[Servidor]', line.rstrip()[:200])
+0|
+4|def send(self, obj):
+8|if self.process.poll() is not None:
+12|raise RuntimeError('El servidor MCP se cerro')
+8|self.process.stdin.write(json.dumps(obj, ensure_ascii=False) + '\n')
+8|self.process.stdin.flush()
+0|
+4|def notify(self, method, params=None):
+8|self.send({'jsonrpc': '2.0', 'method': method, 'params': params or {}})
+0|
+4|def call(self, method, params, timeout=180):
+8|self.counter += 1
+8|reqid = self.counter
+8|self.send({'jsonrpc': '2.0', 'id': reqid, 'method': method, 'params': params})
+8|deadline = time.monotonic() + timeout
+8|while True:
+12|remaining = deadline - time.monotonic()
+12|if remaining <= 0:
+16|raise TimeoutError("El servidor no respondio; el resultado es incierto. No se reintentara automaticamente.")
+12|try:
+16|response = self.inbox.get(timeout=remaining)
+12|except queue.Empty:
+16|raise TimeoutError('El servidor no respondio; resultado incierto. No se reintentara automaticamente.') from None
+12|if response.get('_closed'):
+16|raise RuntimeError('El servidor MCP se cerro')
+12|if 'method' in response:
+16|self._server_request(response)
+16|continue
+12|if response.get('id') != reqid:
+16|continue
+12|if 'error' in response:
+16|raise RuntimeError(str(response['error']))
+12|return response.get('result', {})
+0|
+4|def _server_request(self, message):
+8|# Server consent prompts belong to the server; never accept silently.
+8|if 'id' not in message:
+12|return
+8|if message.get('method') == 'ping':
+12|self.send({'jsonrpc': '2.0', 'id': message['id'], 'result': {}})
+8|elif message.get('method') == 'elicitation/create':
+12|params = message.get('params', {})
+12|print('\nSolicitud de consentimiento del servidor:', params.get('message', ''))
+12|schema = params.get('requestedSchema', {})
+12|try:
+16|content = collect_fields(schema)
+16|validate_schema(schema, schema, content, 'consentimiento')
+16|action = 'accept' if input('Autorizar esta solicitud del servidor? (s/N): ').strip().lower() == 's' else 'decline'
+16|result = {'action': action}
+16|if action == 'accept':
+20|result['content'] = content
+12|except (ValueError, RuntimeError):
+16|result = {'action': 'decline'}
+12|self.send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
+8|else:
+12|self.send({'jsonrpc': '2.0', 'id': message['id'],
+23|'error': {'code': -32601, 'message': 'Solicitud no soportada por este cliente'}})
+0|
+4|def tool(self, name, args):
+8|enforce_policy(self, name, args)
+8|result = self.call('tools/call', {'name': name, 'arguments': args})
+8|if self.debug:
+12|pretty(result)
+8|return unwrap_result(result)
+0|
+4|def close(self):
+8|if self.process.poll() is None:
+12|self.process.terminate()
+12|try:
+16|self.process.wait(timeout=3)
+12|except subprocess.TimeoutExpired:
+16|self.process.kill()
+16|self.process.wait(timeout=3)
+8|for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+12|if stream:
+16|stream.close()
+0|
+0|
+0|def pretty(value):
+4|print(json.dumps(value, indent=2, ensure_ascii=False, default=str))
+0|
+0|
+0|def tool_schema(client, tool):
+4|if tool not in client.tools:
+8|raise RuntimeError('Herramienta no disponible: ' + tool)
+4|return client.tools[tool].get('inputSchema', {})
+0|
+0|
+0|READ_OPERATIONS = {
+4|'connection_operations': {'Help', 'ListLocalInstances', 'Connect', 'GetConnection', 'ListConnections'},
+4|'table_operations': {'Help', 'List', 'Get', 'GetSchema', 'ExportTMDL', 'ExportTMSL'},
+4|'measure_operations': {'Help', 'List', 'Get', 'ExportTMDL'},
+4|'column_operations': {'Help', 'List', 'Get', 'ExportTMDL'},
+4|'relationship_operations': {'Help', 'List', 'Get', 'Find', 'ExportTMDL'},
+4|'dax_query_operations': {'Help', 'Execute', 'Validate'},
+0|}
+0|
+0|
+0|def enforce_policy(client, tool, args):
+4|operation = args.get('request', {}).get('operation')
+4|if not client.writable and operation not in READ_OPERATIONS.get(tool, set()):
+8|raise RuntimeError('Operacion bloqueada en modo solo lectura')
+0|
+0|
+0|def decode_json(value):
+4|for _ in range(12):
+8|if not isinstance(value, str):
+12|break
+8|try:
+12|decoded = json.loads(value)
+8|except (ValueError, TypeError):
+12|break
+8|if decoded == value:
+12|break
+8|value = decoded
+4|return value
+0|
+0|
+0|def unwrap_result(value):
+4|value = decode_json(value)
+4|if isinstance(value, list):
+8|return [unwrap_result(item) for item in value]
+4|if not isinstance(value, dict):
+8|return value
+4|if (value.get('isError') or value.get('success') is False or value.get('error') or
+12|str(value.get('status', '')).casefold() in ('failed', 'error', 'failure')):
+8|raise RuntimeError(error_message(value))
+4|if 'content' in value:
+8|values = []
+8|for item in value.get('content', []):
+12|if item.get('type') == 'text':
+16|values.append(unwrap_result(item.get('text', '')))
+12|elif item.get('type') == 'resource':
+16|values.append(unwrap_result(item.get('resource', {}).get('text', '')))
+8|if 'structuredContent' in value:
+12|return unwrap_result(value['structuredContent'])
+8|return values[0] if len(values) == 1 else values or value
+4|return {key: unwrap_result(item) if isinstance(item, (dict, list)) or key in ('data', 'result')
+12|else item for key, item in value.items()}
+0|
+0|
+0|def error_message(value):
+4|if isinstance(value, str):
+8|parsed = decode_json(value)
+8|return error_message(parsed) if not isinstance(parsed, str) else parsed
+4|if isinstance(value, list):
+8|return '; '.join(error_message(x) for x in value)
+4|if isinstance(value, dict):
+8|for key in ('message', 'errorMessage', 'error', 'content', 'text', 'errors'):
+12|if value.get(key):
+16|return error_message(value[key])
+4|return 'El servidor informo un error; consulta --debug para ver la respuesta completa'
+0|
+0|
+0|def resolve_schema(root, schema):
+4|if not isinstance(schema, dict):
+8|return {}
+4|if '$ref' in schema:
+8|ref = schema['$ref']
+8|if not ref.startswith('#/'):
+12|raise RuntimeError('Referencia de esquema externa no soportada')
+8|target = root
+8|for part in ref[2:].split('/'):
+12|target = target[part.replace('~1', '/').replace('~0', '~')]
+8|return resolve_schema(root, target)
+4|for key in ('anyOf', 'oneOf'):
+8|if key in schema:
+12|choices = [resolve_schema(root, item) for item in schema[key] if item.get('type') != 'null']
+12|if len(choices) != 1:
+16|raise RuntimeError('Esquema ambiguo; consulta herramientas avanzadas')
+12|return choices[0]
+4|if 'allOf' in schema:
+8|merged = {'properties': {}, 'required': []}
+8|for part in schema['allOf']:
+12|part = resolve_schema(root, part)
+12|merged['properties'].update(part.get('properties', {}))
+12|merged['required'].extend(part.get('required', []))
+8|return merged
+4|return schema
+0|
+0|
+0|def request_schema(client, tool):
+4|root = tool_schema(client, tool)
+4|return resolve_schema(root, root.get('properties', {}).get('request', {}))
+0|
+0|
+0|def operation_supported(client, tool, operation):
+4|root = tool_schema(client, tool)
+4|spec = resolve_schema(root, request_schema(client, tool).get('properties', {}).get('operation', {}))
+4|if spec.get('enum'):
+8|return operation in spec['enum']
+4|description = spec.get('description') or client.tools[tool].get('description', '')
+4|return bool(re.search(r'\b' + re.escape(operation) + r'\b', description))
+0|
+0|
+0|def validate_schema(root, schema, value, path='request'):
+4|schema = resolve_schema(root, schema)
+4|if value is None and (schema.get('type') == 'null' or 'null' in schema.get('type', [])):
+8|return
+4|typ = schema.get('type')
+4|if isinstance(typ, list):
+8|typ = next((t for t in typ if t != 'null'), None)
+4|types = {'object': dict, 'array': list, 'string': str, 'boolean': bool,
+13|'integer': int, 'number': (int, float)}
+4|if typ in types and (not isinstance(value, types[typ]) or
+25|(typ in ('integer', 'number') and isinstance(value, bool))):
+8|raise ValueError(path + ': tipo incorrecto')
+4|if 'enum' in schema and value not in schema['enum']:
+8|raise ValueError(path + ': valor no admitido')
+4|if isinstance(value, dict):
+8|props = schema.get('properties', {})
+8|missing = set(schema.get('required', [])) - value.keys()
+8|if missing:
+12|raise ValueError(path + ': faltan campos ' + ', '.join(sorted(missing)))
+8|for key, item in value.items():
+12|if key not in props:
+16|if schema.get('additionalProperties') is False:
+20|raise ValueError(path + ': campo no admitido ' + key)
+12|else:
+16|validate_schema(root, props[key], item, path + '.' + key)
+4|elif isinstance(value, list):
+8|if len(value) < schema.get('minItems', 0):
+12|raise ValueError(path + ': lista vacia')
+8|for item in value:
+12|validate_schema(root, schema.get('items', {}), item, path + '[]')
+0|
+0|
+0|def request_call(client, tool, operation, **fields):
+4|schema = request_schema(client, tool)
+4|props = schema.get('properties', {})
+4|if not operation_supported(client, tool, operation):
+8|raise RuntimeError(f'Operacion {operation} no disponible en {tool}')
+4|req = {'operation': operation}
+4|# Connect forbids connectionName. Never reuse the old model implicitly.
+4|if tool != 'connection_operations' or operation == 'GetConnection':
+8|if not client.connection_name:
+12|raise RuntimeError('No hay conexion valida; selecciona un modelo')
+8|if 'connectionName' not in props:
+12|raise RuntimeError('El esquema no permite identificar la conexion de forma explicita')
+8|req['connectionName'] = client.connection_name
+4|for key, value in fields.items():
+8|if value is None:
+12|continue
+8|if key not in props:
+12|raise RuntimeError(f'El servidor no admite el campo {key} para {tool}')
+8|req[key] = value
+4|args = {'request': req}
+4|enforce_policy(client, tool, args)
+4|validate_schema(tool_schema(client, tool), tool_schema(client, tool), args, 'arguments')
+4|try:
+8|return unwrap_result(client.tool(tool, args))
+4|except (RuntimeError, TimeoutError, OSError) as exc:
+8|invalidate_on_error(client, exc)
+8|raise
+0|
+0|
+0|def invalidate_on_error(client, exc):
+4|message = str(exc).casefold()
+4|if isinstance(exc, (TimeoutError, OSError)) or any(word in message for word in (
+12|'connection', 'conexion', 'conexión', 'disconnected', 'servidor mcp se cerro', 'not connected')):
+8|client.connection_name = None
+8|client.model_name = None
+8|client.instance = None
+0|
+0|
+0|def data_value(value):
+4|value = decode_json(value)
+4|for _ in range(12):
+8|if isinstance(value, dict) and 'data' in value:
+12|value = decode_json(value['data'])
+8|else:
+12|break
+4|return value
+0|
+0|
+0|def object_rows(value, kind=None):
+4|value = data_value(value)
+4|if value is None:
+8|return []
+4|if isinstance(value, list):
+8|result = []
+8|for item in value:
+12|result.extend(object_rows(item, kind))
+8|return result
+4|if isinstance(value, dict):
+8|for key in (kind, 'items', 'results', 'instances', 'rows'):
+12|if key and key in value:
+16|rows = object_rows(value[key], kind)
+16|if value.get('tableName') and key in ('measures', 'columns'):
+20|rows = [dict(row, tableName=row.get('tableName') or value['tableName']) for row in rows]
+16|return rows
+8|if 'name' in value or 'port' in value or 'fromTable' in value:
+12|return [value]
+8|if not value:
+12|return []
+4|raise RuntimeError('Formato de respuesta desconocido; usa --debug u opcion 12')
+0|
+0|
+0|def list_instances(client):
+4|return object_rows(request_call(client, 'connection_operations', 'ListLocalInstances'), 'instances')
+0|
+0|
+0|def choose(items, prompt='Selecciona: ', multiple=False):
+4|raw = input(prompt).strip()
+4|if not raw or raw == '0':
+8|return [] if multiple else None
+4|try:
+8|indices = list(dict.fromkeys(int(v.strip()) - 1 for v in raw.split(',')))
+8|if not multiple and len(indices) != 1:
+12|raise ValueError()
+8|if any(i < 0 or i >= len(items) for i in indices):
+12|raise ValueError()
+4|except ValueError:
+8|raise ValueError('Seleccion invalida') from None
+4|selected = [items[i] for i in indices]
+4|return selected if multiple else selected[0]
+0|
+0|
+0|def connect(client):
+4|print('\nBuscando modelos de Power BI Desktop...')
+4|instances = list_instances(client)
+4|if not instances:
+8|client.connection_name = client.model_name = client.instance = None
+8|print('No hay modelos abiertos. Abre Power BI Desktop y un archivo PBIX.')
+8|return
+4|print('Modelos encontrados:')
+4|for i, inst in enumerate(instances, 1):
+8|print(f'{i}. {inst.get("parentWindowTitle") or inst.get("name") or "Sin titulo"} (puerto {inst.get("port", "?")})')
+4|print('0. Cancelar')
+4|inst = choose(instances, 'Selecciona el modelo: ')
+4|if inst is None:
+8|return
+4|connstr = inst.get('connectionString')
+4|if not connstr:
+8|port = int(inst['port'])
+8|if not 1 <= port <= 65535:
+12|raise ValueError('Puerto invalido')
+8|connstr = f'Data Source=localhost:{port};Application Name=PBIModeling'
+4|# Clear old identity first: even an ambiguous Connect response must not select it.
+4|client.connection_name = client.model_name = client.instance = None
+4|result = request_call(client, 'connection_operations', 'Connect', connectionString=connstr)
+4|data = data_value(result)
+4|name = data if isinstance(data, str) else data.get('connectionName') if isinstance(data, dict) else None
+4|if not name and isinstance(result, dict):
+8|name = result.get('connectionName')
+4|if not isinstance(name, str) or not name.strip():
+8|raise RuntimeError('El servidor no devolvio un identificador de conexion valido')
+4|client.connection_name = name
+4|client.model_name = inst.get('parentWindowTitle') or inst.get('name') or name
+4|client.instance = dict(inst)
+4|print('CONECTADO A:', client.model_name)
+0|
+0|
+0|def ensure_connected(client):
+4|if not client.connection_name:
+8|print('Primero selecciona la opcion 1 para conectar.')
+8|return False
+4|try:
+8|if client.instance:
+12|instances = list_instances(client)
+12|if not any(str(i.get('port')) == str(client.instance.get('port')) and
+23|(i.get('parentWindowTitle') or i.get('name')) ==
+23|(client.instance.get('parentWindowTitle') or client.instance.get('name')) and
+23|all(client.instance.get(key) is None or i.get(key) == client.instance[key]
+27|for key in ('processId', 'startTime')) for i in instances):
+16|raise RuntimeError('Conexion cerrada: el modelo ya no aparece en Power BI Desktop')
+8|if operation_supported(client, 'connection_operations', 'GetConnection'):
+12|result = request_call(client, 'connection_operations', 'GetConnection')
+12|if data_value(result) is None:
+16|raise RuntimeError('Conexion invalida')
+8|return True
+4|except (RuntimeError, TimeoutError, OSError) as exc:
+8|client.connection_name = client.model_name = client.instance = None
+8|print('ERROR: conexion no disponible:', exc)
+8|return False
+0|
+0|
+0|def list_objects(client, tool):
+4|fields = {}
+4|root = tool_schema(client, tool)
+4|props = request_schema(client, tool).get('properties', {})
+4|# Current server defaults to only 200 objects. Explicitly raise the cap and
+4|# warn at the cap rather than quietly claiming a complete model inventory.
+4|if 'filter' in props:
+8|filt = resolve_schema(root, props['filter']).get('properties', {})
+8|if 'maxResults' in filt:
+12|fields['filter'] = {'maxResults': 100000}
+4|rows = object_rows(request_call(client, tool, 'List', **fields), tool.split('_')[0] + 's')
+4|if len(rows) >= 100000:
+8|print('Advertencia: se alcanzo el limite; el listado puede estar incompleto.')
+4|return rows
+0|
+0|
+0|def object_reference(obj, table=False):
+4|if not obj.get('name'):
+8|raise ValueError('El objeto no tiene nombre')
+4|ref = {'name': obj['name']}
+4|if not table:
+8|if not obj.get('tableName'):
+12|raise ValueError('El servidor no devolvio la tabla del objeto; no es seguro seleccionarlo')
+8|ref['tableName'] = obj['tableName']
+4|return ref
+0|
+0|
+0|def get_object(client, tool, obj):
+4|rows = object_rows(request_call(client, tool, 'Get', references=[object_reference(obj, tool == 'table_operations')]), tool.split('_')[0] + 's')
+4|if len(rows) != 1:
+8|raise RuntimeError('No se pudo identificar un unico objeto')
+4|return dict(obj, **rows[0])
+0|
+0|
+0|def show_objects(rows):
+4|for i, obj in enumerate(rows, 1):
+8|print(f'{i}. [{obj.get("name", "Sin nombre")}] — {obj.get("tableName", "")}')
+4|print('Total:', len(rows))
+0|
+0|
+0|def display_result(result):
+4|data = data_value(result)
+4|if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+8|display_grid(data)
+4|elif isinstance(data, dict):
+8|for key, value in data.items():
+12|print(f'{key}: {value}')
+4|else:
+8|print(data if data is not None else 'Sin resultados.')
+0|
+0|
+0|def display_grid(rows):
+4|if not rows:
+8|print('Sin resultados.')
+8|return
+4|keys = list(dict.fromkeys(k for row in rows for k in row))
+4|widths = {k: min(60, max(len(str(k)), *(len(str(row.get(k, ''))) for row in rows))) for k in keys}
+4|print(' | '.join(str(k).ljust(widths[k]) for k in keys))
+4|for row in rows:
+8|print(' | '.join(str(row.get(k, ''))[:widths[k]].ljust(widths[k]) for k in keys))
+4|print('Filas:', len(rows), '(celdas en pantalla limitadas a 60 caracteres; CSV conserva el valor)')
+0|
+0|
+0|def simple_list(client, tool, title):
+4|if not ensure_connected(client):
+8|return
+4|print(f'\n{title} | Modelo: {client.model_name}')
+4|rows = list_objects(client, tool)
+4|if tool == 'relationship_operations':
+8|for i, obj in enumerate(rows, 1):
+12|print(f'{i}. {obj.get("fromTable", "?")}[{obj.get("fromColumn", "?")}] → {obj.get("toTable", "?")}[{obj.get("toColumn", "?")}]')
+12|for key in ('fromCardinality', 'toCardinality', 'isActive', 'crossFilteringBehavior', 'securityFilteringBehavior'):
+16|if key in obj:
+20|print(f'   {key}: {obj[key]}')
+8|print('Total:', len(rows))
+8|return
+4|show_objects(rows)
+4|if not rows:
+8|return
+4|if tool == 'measure_operations':
+8|while True:
+12|raw = input('Numero para ver DAX, /texto para filtrar nombre/tabla, Enter para regresar: ').strip()
+12|if not raw:
+16|return
+12|if raw.startswith('/'):
+16|text = raw[1:].casefold()
+16|filtered = [r for r in rows if text in (r.get('name', '') + ' ' + r.get('tableName', '')).casefold()]
+16|show_objects(filtered)
+16|if filtered:
+20|obj = choose(filtered, 'Selecciona medida (Enter=regresar): ')
+16|else:
+20|continue
+12|else:
+16|if not raw.isdigit() or not 1 <= int(raw) <= len(rows):
+20|print('Seleccion invalida')
+20|continue
+16|obj = rows[int(raw) - 1]
+12|if obj:
+16|show_details(get_object(client, tool, obj))
+4|elif operation_supported(client, tool, 'Get'):
+8|obj = choose(rows, 'Tabla para ver estructura (Enter=regresar): ')
+8|if obj:
+12|show_details(get_object(client, tool, obj))
+12|if 'column_operations' in client.tools:
+16|columns = [r for r in list_objects(client, 'column_operations') if r.get('tableName') == obj['name']]
+16|display_grid(columns)
+0|
+0|
+0|def show_details(obj):
+4|for key in ('name', 'tableName', 'type', 'columnType', 'isCalculated', 'dataType', 'expression', 'description', 'displayFolder', 'formatString', 'isHidden'):
+8|if key in obj:
+12|print(f'{key}:\n{obj[key]}' if key == 'expression' else f'{key}: {obj[key]}')
+0|
+0|
+0|def field_value(name, spec, required=False):
+4|typ = spec.get('type', 'string')
+4|if isinstance(typ, list):
+8|typ = next((t for t in typ if t != 'null'), 'string')
+4|if typ == 'object':
+8|return collect_fields(spec)
+4|if typ == 'array':
+8|print(f'  {name}: introduce lista JSON')
+8|raw = input('  JSON: ').strip()
+8|return json.loads(raw) if raw else None
+4|while True:
+8|value = input(f'  {name}{" *" if required else " (Enter=omitir)"}: ').strip()
+8|if not value:
+12|if required:
+16|print('  Campo obligatorio')
+16|continue
+12|return None
+8|if typ == 'boolean':
+12|if value.lower() in ('s', 'si', 'true', '1'):
+16|return True
+12|if value.lower() in ('n', 'no', 'false', '0'):
+16|return False
+12|print('  Escribe s o n')
+12|continue
+8|if typ in ('integer', 'number'):
+12|try:
+16|return int(value) if typ == 'integer' else float(value)
+12|except ValueError:
+16|print('  Numero invalido')
+16|continue
+8|return value
+0|
+0|
+0|def collect_fields(schema, defaults=None, only_required=False):
+4|defaults = defaults or {}
+4|props = schema.get('properties', {})
+4|required = schema.get('required', [])
+4|result = dict(defaults)
+4|for name, spec in props.items():
+8|if name in result:
+12|continue
+8|if only_required and name not in required:
+12|continue
+8|value = field_value(name, spec, name in required)
+8|if value is not None:
+12|result[name] = value
+4|return result
+0|
+0|
+0|def selected_operation_schema(client, tool):
+4|return request_schema(client, tool)
+0|
+0|
+0|def multiline(label='Expresion DAX', allow_empty=False):
+4|print(label + ' (varias lineas; termina con FIN):')
+4|lines = []
+4|while True:
+8|line = input()
+8|if line.strip() == 'FIN':
+12|break
+8|lines.append(line)
+4|text = '\n'.join(lines).strip()
+4|if not text and not allow_empty:
+8|raise ValueError('La expresion no puede estar vacia')
+4|return text
+0|
+0|
+0|def definition_properties(client, tool):
+4|root = tool_schema(client, tool)
+4|props = request_schema(client, tool).get('properties', {})
+4|if 'definitions' in props:
+8|spec = resolve_schema(root, props['definitions'])
+8|return resolve_schema(root, spec.get('items', {})).get('properties', {})
+4|return props
+0|
+0|
+0|def build_object_fields(client, tool, operation, obj):
+4|props = request_schema(client, tool).get('properties', {})
+4|if operation in ('Create', 'Update'):
+8|available = definition_properties(client, tool)
+8|unsupported = set(obj) - set(available)
+8|if unsupported:
+12|raise RuntimeError('Propiedades no admitidas: ' + ', '.join(sorted(unsupported)))
+8|fields = {'definitions': [obj]} if 'definitions' in props else dict(obj)
+4|else:
+8|ref = object_reference(obj)
+8|if 'references' not in props:
+12|raise RuntimeError('Este esquema de referencias no es compatible; usa opcion 12')
+8|fields = {'references': [ref]}
+8|if 'shouldCascadeDelete' not in props:
+12|raise RuntimeError('El servidor no permite desactivar la eliminacion en cascada')
+8|fields['shouldCascadeDelete'] = False
+4|if 'options' in props:
+8|root = tool_schema(client, tool)
+8|supported = resolve_schema(root, props['options']).get('properties', {})
+8|options = {k: v for k, v in {'continueOnError': False, 'useTransaction': True}.items() if k in supported}
+8|if options:
+12|fields['options'] = options
+4|return fields
+0|
+0|
+0|def confirmed_success(value):
+4|if isinstance(value, dict):
+8|if value.get('success') is True:
+12|return True
+8|if str(value.get('status', '')).casefold() in ('success', 'succeeded', 'completed'):
+12|return True
+8|message = str(value.get('message', '')).casefold()
+8|if 'successfully' in message and not any(x in message for x in ('not ', 'failed', 'pending')):
+12|return True
+8|return any(confirmed_success(v) for k, v in value.items() if k in ('data', 'results', 'items'))
+4|if isinstance(value, list):
+8|return bool(value) and all(confirmed_success(v) for v in value)
+4|return False
+0|
+0|
+0|def verify_write(client, tool, operation, obj):
+4|"""Confirm the resulting server state when a write returns empty content."""
+4|rows = list_objects(client, tool)
+4|present = any(row.get('name') == obj['name'] and row.get('tableName') == obj['tableName'] for row in rows)
+4|if operation == 'Delete':
+8|return not present
+4|if not present:
+8|return False
+4|current = get_object(client, tool, obj)
+4|for key, expected in obj.items():
+8|actual = current.get(key)
+8|if key == 'expression' and isinstance(actual, str):
+12|actual = actual.replace('\r\n', '\n').strip()
+12|expected = expected.replace('\r\n', '\n').strip()
+8|if expected == '' and actual is None and key in ('description', 'displayFolder', 'formatString'):
+12|continue
+8|if actual != expected:
+12|return False
+4|return True
+0|
+0|
+0|def apply_objects(client, tool, operation, objects):
+4|if not client.writable:
+8|raise RuntimeError('Modo solo lectura. Reinicia: python cliente.py --write')
+4|if not objects:
+8|return []
+4|# Build and validate every request before asking for final confirmation.
+4|plans = [(obj, build_object_fields(client, tool, operation, obj)) for obj in objects]
+4|root = tool_schema(client, tool)
+4|for obj, fields in plans:
+8|args = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
+8|validate_schema(root, root, args, 'arguments')
+4|print('\nVISTA PREVIA:', operation, '| Modelo:', client.model_name)
+4|for obj, _ in plans:
+8|show_details(obj)
+4|print('Los cambios pueden afectar dependencias y visuales. Guarda una copia del PBIX.')
+4|if operation == 'Delete':
+8|print('Se desactiva la eliminacion en cascada; si hay dependencias, el servidor puede rechazarla.')
+4|if input('Escribe CONFIRMAR para aplicar: ').strip() != 'CONFIRMAR':
+8|print('Cancelado')
+8|return []
+4|outcomes = []
+4|for obj, fields in plans:
+8|if not ensure_connected(client):
+12|print('Lote detenido. Los objetos restantes no se enviaron.')
+12|break
+8|label = f'{obj.get("tableName", "")}[{obj["name"]}]'
+8|try:
+12|result = request_call(client, tool, operation, **fields)
+12|explicit = confirmed_success(result)
+12|if explicit or verify_write(client, tool, operation, obj):
+16|print('CONFIRMADO' + ('' if explicit else ' POR LECTURA DEL MODELO') + ':', label)
+16|outcomes.append((label, 'confirmado'))
+12|else:
+16|print('SIN CONFIRMACION:', label, 'Consulta el modelo antes de volver a intentar.')
+16|display_result(result)
+16|outcomes.append((label, 'incierto'))
+8|except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+12|print('ERROR:', label, exc)
+12|outcomes.append((label, 'error'))
+12|if not client.connection_name:
+16|print('Lote detenido. Verifica el modelo antes de reintentar.')
+16|break
+4|print('Resumen:', ', '.join(f'{label}: {state}' for label, state in outcomes) or 'Sin operaciones')
+4|return outcomes
+0|
+0|
+0|def calculated_column(obj):
+4|# A calculated expression alone is insufficient: calculated-table columns
+4|# may also carry expressions but must not be treated as editable DAX columns.
+4|typ = str(obj.get('type', obj.get('columnType', ''))).casefold()
+4|if typ:
+8|return typ in ('calculated', 'calculatedcolumn')
+4|return obj.get('isCalculated') is True and not obj.get('sourceColumn')
+0|
+0|
+0|def edit_objects(client, tool, operation, label):
+4|if not client.writable:
+8|print('Modo solo lectura. Reinicia: python cliente.py --write')
+8|return
+4|if not ensure_connected(client):
+8|return
+4|if not operation_supported(client, tool, operation):
+8|print('Operacion no disponible en esta version del servidor.')
+8|return
+4|print(f'\n{operation} {label} | Modelo: {client.model_name}')
+4|existing = list_objects(client, tool)
+4|objects = []
+4|available = definition_properties(client, tool)
+4|if operation == 'Create':
+8|tables = list_objects(client, 'table_operations')
+8|if not tables:
+12|print('No hay tablas disponibles.')
+12|return
+8|while True:
+12|show_objects(tables)
+12|table = choose(tables, 'Tabla (Enter=cancelar): ')
+12|if table is None:
+16|return
+12|name = input('Nombre: ').strip()
+12|if not name:
+16|raise ValueError('El nombre no puede estar vacio')
+12|# Measures have a model-wide namespace; columns have a table namespace.
+12|if any(r.get('name', '').casefold() == name.casefold() and
+19|(tool == 'measure_operations' or r.get('tableName', '').casefold() == table['name'].casefold())
+19|for r in existing + objects):
+16|raise ValueError('El nombre ya existe en el modelo o en este lote')
+12|obj = {'name': name, 'tableName': table['name'], 'expression': multiline()}
+12|if tool == 'column_operations':
+16|# Current schema infers calculated column from expression.
+16|if 'expression' not in available:
+20|raise RuntimeError('El servidor no admite columnas calculadas con este esquema')
+12|objects.append(obj)
+12|if input('¿Agregar otro objeto? (s/N): ').strip().lower() != 's':
+16|break
+4|else:
+8|if tool == 'column_operations':
+12|tables = list_objects(client, 'table_operations')
+12|show_objects(tables)
+12|table = choose(tables, 'Tabla (Enter=cancelar): ')
+12|if not table:
+16|return
+12|existing = [r for r in existing if r.get('tableName') == table['name']]
+12|for obj in existing:
+16|print(f'{obj["name"]}: tipo {obj.get("type", obj.get("columnType", "no informado; se verificara al seleccionar"))}')
+8|show_objects(existing)
+8|selected = choose(existing, 'Selecciona uno o varios (1,3; Enter=cancelar): ', multiple=True)
+8|for obj in selected:
+12|current = get_object(client, tool, obj)
+12|show_details(current)
+12|if tool == 'column_operations' and not calculated_column(current):
+16|print('Omitida: columna importada, de tabla calculada o tipo no confirmado. Este menu solo edita/elimina columnas calculadas DAX.')
+16|continue
+12|if operation == 'Delete':
+16|objects.append(object_reference(current))
+16|continue
+12|changes = object_reference(current)
+12|expression = multiline('Nueva expresion DAX (FIN sin texto conserva la actual)', allow_empty=True)
+12|if expression and expression != current.get('expression'):
+16|changes['expression'] = expression
+12|for key, caption in (('description', 'Descripcion'), ('displayFolder', 'Carpeta de visualizacion'),
+33|('formatString', 'Formato')):
+16|if key in available:
+20|value = input(f'{caption} (Enter=conservar, /vaciar=borrar): ')
+20|if value:
+24|changes[key] = '' if value == '/vaciar' else value
+12|if len(changes) == 2:
+16|continue
+12|print('DIFERENCIAS:', current['name'])
+12|for key in changes.keys() - {'name', 'tableName'}:
+16|print(key + ':')
+16|for line in difflib.unified_diff(str(current.get(key, '')).splitlines(), str(changes[key]).splitlines(),
+49|fromfile='Actual', tofile='Propuesto', lineterm=''):
+20|print(line)
+12|objects.append(changes)
+4|apply_objects(client, tool, operation, objects)
+0|
+0|
+0|def dax_rows(value):
+4|value = data_value(value)
+4|if isinstance(value, list):
+8|if all(isinstance(x, dict) for x in value):
+12|return value
+4|if isinstance(value, dict):
+8|if 'rows' in value:
+12|rows = value['rows']
+12|if isinstance(rows, list) and all(isinstance(x, dict) for x in rows):
+16|return rows
+12|columns = value.get('columns', [])
+12|names = [c.get('name', c.get('columnName', '')) if isinstance(c, dict) else str(c) for c in columns]
+12|if names and isinstance(rows, list) and all(isinstance(r, list) and len(r) == len(names) for r in rows):
+16|return [dict(zip(names, r)) for r in rows]
+8|for key in ('tables', 'results', 'result'):
+12|if key in value:
+16|nested = value[key]
+16|if not isinstance(nested, list):
+20|nested = [nested]
+16|rows = []
+16|for item in nested:
+20|rows.extend(dax_rows(item))
+16|return rows
+4|raise RuntimeError('Formato DAX no reconocido; consulta la respuesta en modo depuracion')
+0|
+0|
+0|def save_csv(rows, path):
+4|path = Path(path)
+4|if path.exists():
+8|raise ValueError('El archivo ya existe; elige otro nombre')
+4|keys = list(dict.fromkeys(k for row in rows for k in row))
+4|with path.open('x', encoding='utf-8-sig', newline='') as stream:
+8|writer = csv.DictWriter(stream, fieldnames=keys)
+8|writer.writeheader()
+8|writer.writerows(rows)
+4|print('CSV guardado:', path.resolve())
+0|
+0|
+0|def dax_query(client):
+4|if not ensure_connected(client):
+8|return
+4|dax = multiline('Consulta DAX | Modelo: ' + client.model_name)
+4|# Only the query tool Execute operation is used; no XMLA/TMSL or model writes.
+4|props = request_schema(client, 'dax_query_operations').get('properties', {})
+4|key = next((k for k in ('query', 'daxQuery', 'queryText') if k in props), None)
+4|if not key:
+8|raise RuntimeError('Esquema DAX no compatible; consulta opcion 12')
+4|fields = {key: dax}
+4|if 'resultMode' in props:
+8|fields['resultMode'] = 'Inline'
+4|if 'maxRows' in props:
+8|fields['maxRows'] = 1000
+4|rows = dax_rows(request_call(client, 'dax_query_operations', 'Execute', **fields))
+4|display_grid(rows)
+4|if len(rows) >= 1000:
+8|print('Se alcanzo el limite de 1000 filas; el resultado puede estar truncado.')
+4|if rows:
+8|name = input('Guardar CSV (ruta; Enter=omitir): ').strip()
+8|if name:
+12|save_csv(rows, name)
+0|
+0|
+0|AI_ACTIONS = {
+4|'create_measure': ('measure_operations', 'Create'),
+4|'update_measure': ('measure_operations', 'Update'),
+4|'delete_measure': ('measure_operations', 'Delete'),
+4|'create_column': ('column_operations', 'Create'),
+4|'update_column': ('column_operations', 'Update'),
+4|'delete_column': ('column_operations', 'Delete'),
+4|'execute_dax': ('dax_query_operations', 'Execute'),
+0|}
+0|AI_PROPERTIES = {'description', 'displayFolder', 'formatString', 'isHidden', 'dataType'}
+0|AI_LABELS = {
+4|'create_measure': 'Crear medida', 'update_measure': 'Modificar medida',
+4|'delete_measure': 'Eliminar medida', 'create_column': 'Crear columna calculada',
+4|'update_column': 'Modificar columna calculada', 'delete_column': 'Eliminar columna calculada',
+4|'execute_dax': 'Consultar DAX',
+0|}
+0|
+0|
+0|def parse_ai_block(text):
+4|"""Strict JSON only. No code evaluation, shell commands or connection overrides."""
+4|def pairs(items):
+8|result = {}
+8|for key, value in items:
+12|if key in result:
+16|raise ValueError('Clave JSON duplicada: ' + key)
+12|result[key] = value
+8|return result
+0|
+4|def invalid_constant(value):
+8|raise ValueError('Constante JSON no permitida: ' + value)
+0|
+4|value = json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant)
+4|if not isinstance(value, dict):
+8|raise ValueError('El bloque debe ser un objeto JSON')
+4|if 'operations' in value:
+8|if set(value) != {'operations'} or not isinstance(value['operations'], list):
+12|raise ValueError('Usa un objeto con solo operations y una lista de operaciones')
+8|operations = value['operations']
+4|else:
+8|operations = [value]
+4|if not operations:
+8|raise ValueError('El bloque no contiene operaciones')
+4|expanded = []
+4|for index, op in enumerate(operations, 1):
+8|if not isinstance(op, dict):
+12|raise ValueError(f'Instruccion {index}: se requiere un objeto')
+8|if op.get('action') == 'delete_measures':
+12|if set(op) != {'action', 'table', 'names'} or not isinstance(op['names'], list) or not op['names']:
+16|raise ValueError(f'Instruccion {index}: delete_measures requiere table y names no vacio')
+12|expanded.extend({'action': 'delete_measure', 'table': op['table'], 'name': name} for name in op['names'])
+8|else:
+12|expanded.append(dict(op))
+4|for index, op in enumerate(expanded, 1):
+8|action = op.get('action')
+8|if not isinstance(action, str) or action not in AI_ACTIONS:
+12|raise ValueError(f'Operacion {index}: accion no permitida')
+8|if action == 'execute_dax':
+12|allowed, required = {'action', 'query', 'maxRows'}, {'action', 'query'}
+8|else:
+12|required = {'action', 'table', 'name'}
+12|allowed = required if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
+12|if action.startswith('create_'):
+16|required = required | {'expression'}
+8|if set(op) - allowed or required - set(op):
+12|raise ValueError(f'Operacion {index}: campos faltantes o no permitidos: ' +
+29|', '.join(sorted((set(op) - allowed) | (required - set(op)))))
+8|for key in ('table', 'name', 'expression', 'query'):
+12|if key in op and (not isinstance(op[key], str) or not op[key].strip()):
+16|raise ValueError(f'Operacion {index}: {key} debe ser texto no vacio')
+8|for key in AI_PROPERTIES & op.keys():
+12|if (key == 'isHidden' and not isinstance(op[key], bool)) or (key != 'isHidden' and not isinstance(op[key], str)):
+16|raise ValueError(f'Operacion {index}: tipo incorrecto para {key}')
+8|if action.startswith('update_') and not (op.keys() & (AI_PROPERTIES | {'expression'})):
+12|raise ValueError(f'Operacion {index}: no hay propiedades para modificar')
+8|if 'maxRows' in op and (type(op['maxRows']) is not int or not 1 <= op['maxRows'] <= 100000):
+12|raise ValueError(f'Operacion {index}: maxRows debe estar entre 1 y 100000')
+4|return expanded
+0|
+0|
+0|def dax_references(expression):
+4|"""Conservative lexical scan, not a full DAX parser; ignores strings/comments."""
+4|pattern = re.compile(r'"(?:[^"]|"")*"|//[^\n]*|--[^\n]*|/\*.*?\*/|'
+25|r"(?:(?:'((?:[^']|'')+)'|([\w]+))\s*)?\[((?:[^\]]|\]\])+?)\]", re.DOTALL)
+4|refs = set()
+4|for match in pattern.finditer(expression):
+8|if match.group(3) is not None:
+12|table = match.group(1) or match.group(2)
+12|refs.add((table.replace("''", "'").casefold() if table else None,
+22|match.group(3).replace(']]', ']').casefold()))
+4|return refs
+0|
+0|
+0|def ai_object(op):
+4|return {'tableName': op['table'], 'name': op['name'],
+12|**{key: op[key] for key in AI_PROPERTIES | {'expression'} if key in op}}
+0|
+0|
+0|def ai_query_fields(client, op):
+4|props = request_schema(client, 'dax_query_operations').get('properties', {})
+4|fields = {'query': op['query']}
+4|if 'resultMode' in props:
+8|fields['resultMode'] = 'Inline'
+4|if 'maxRows' in props:
+8|fields['maxRows'] = op.get('maxRows', 1000)
+4|elif 'maxRows' in op:
+8|raise ValueError('El servidor no admite maxRows')
+4|return fields
+0|
+0|
+0|def validate_ai_block(client, operations):
+4|"""Preflight complete ordered plan against a virtual, case-insensitive catalog."""
+4|if not client.connection_name:
+8|raise ValueError('No hay conexion activa')
+4|if not client.writable and any(op['action'] != 'execute_dax' for op in operations):
+8|raise ValueError('El bloque contiene escrituras: inicia con --write')
+4|tables = {row['name'].casefold(): row['name'] for row in list_objects(client, 'table_operations')}
+4|kinds = {AI_ACTIONS[op['action']][0] for op in operations} - {'dax_query_operations'}
+4|# Measures are also needed to resolve DAX references in column expressions.
+4|if any('expression' in op for op in operations) or any(op['action'].startswith('delete_') for op in operations):
+8|kinds.add('measure_operations')
+4|inventory = {tool: {} for tool in kinds}
+4|for tool in kinds:
+8|for row in list_objects(client, tool):
+12|if not row.get('tableName'):
+16|raise ValueError('No se pudo identificar la tabla de un objeto')
+12|inventory[tool][(row['tableName'].casefold(), row['name'].casefold())] = dict(row)
+4|plan, warnings, seen, histories, removed = [], [], set(), {}, set()
+4|relationships = list_objects(client, 'relationship_operations') if any(op['action'] == 'delete_column' for op in operations) else []
+4|measure_tool = 'measure_operations'
+4|# Read metadata once per tool, not once per instruction in a large block.
+4|if any(op['action'].startswith('delete_') or 'expression' in op for op in operations):
+8|for tool in ('measure_operations', 'column_operations'):
+12|if tool not in client.tools or not operation_supported(client, tool, 'Get'):
+16|warnings.append(f'{tool}: no se pueden leer todas las dependencias en esta version del servidor.')
+16|continue
+12|if tool not in inventory:
+16|inventory[tool] = {(r['tableName'].casefold(), r['name'].casefold()): dict(r)
+35|for r in list_objects(client, tool)}
+12|rows = list(inventory[tool].values())
+12|if rows:
+16|details = object_rows(request_call(client, tool, 'Get', references=[object_reference(r) for r in rows]),
+38|'measures' if tool == measure_tool else 'columns')
+16|by_name = {}
+16|for key in inventory[tool]:
+20|by_name.setdefault(key[1], []).append(key)
+16|for detail in details:
+20|keys = [key for key in by_name.get(str(detail.get('name', '')).casefold(), []) if
+28|(not detail.get('tableName') or key[0] == detail['tableName'].casefold())]
+20|if len(keys) == 1:
+24|inventory[tool][keys[0]].update(detail)
+16|if any('expression' not in r and tool == measure_tool for r in inventory[tool].values()):
+20|warnings.append('Algunas expresiones existentes no se pudieron leer; el analisis de dependencias es parcial.')
+16|if tool == 'column_operations' and any('columnType' not in r for r in inventory[tool].values()):
+20|warnings.append('No se pudieron asociar todos los detalles de columnas; el analisis de dependencias es parcial.')
+4|future = {(op['table'].casefold(), op['name'].casefold()): i for i, op in enumerate(operations, 1)
+14|if op['action'].startswith('create_')}
+4|for index, original in enumerate(operations, 1):
+8|op = dict(original)
+8|tool, operation = AI_ACTIONS[op['action']]
+8|if not operation_supported(client, tool, operation):
+12|raise ValueError(f'Operacion {index}: {tool}.{operation} no disponible')
+8|fingerprint = json.dumps(op, sort_keys=True, ensure_ascii=False)
+8|if fingerprint in seen:
+12|raise ValueError(f'Operacion {index}: instruccion duplicada')
+8|seen.add(fingerprint)
+8|if tool == 'dax_query_operations':
+12|for ref_table, ref_name in dax_references(op['query']):
+16|if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+20|raise ValueError(f'Operacion {index}: consulta utiliza un objeto eliminado previamente: [{ref_name}]')
+16|if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in future) and not any(
+24|k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+24|for rows in inventory.values() for k in rows):
+20|raise ValueError(f'Operacion {index}: consulta utiliza un objeto creado despues: [{ref_name}]')
+12|fields = ai_query_fields(client, op)
+8|else:
+12|key = (op['table'].casefold(), op['name'].casefold())
+12|if key[0] not in tables:
+16|raise ValueError(f'Operacion {index}: tabla inexistente: {op["table"]}')
+12|op['table'] = tables[key[0]]
+12|objects = inventory[tool]
+12|current = objects.get(key)
+12|if operation == 'Create':
+16|conflict = current or (tool == measure_tool and any(k[1] == key[1] for k in objects))
+16|if conflict:
+20|raise ValueError(f'Operacion {index}: nombre ya existente: {op["name"]}')
+12|elif not current:
+16|raise ValueError(f'Operacion {index}: objeto inexistente: {op["table"]}[{op["name"]}]')
+12|if current:
+16|op['name'] = current['name']
+12|target = (tool, key)
+12|history = histories.setdefault(target, [])
+12|if operation in history:
+16|raise ValueError(f'Operacion {index}: accion repetida para el mismo objeto')
+12|if history and history[-1] == 'Delete':
+16|raise ValueError(f'Operacion {index}: recreacion contradictoria tras Delete; divide los bloques')
+12|if history:
+16|warnings.append(f'Operacion {index}: {operation} actua sobre un objeto utilizado antes en el lote.')
+12|if tool == 'column_operations' and current and not history:
+16|current.update(get_object(client, tool, current))
+16|if not calculated_column(current):
+20|raise ValueError(f'Operacion {index}: columna de origen o tipo no compatible')
+12|if operation == 'Delete':
+16|if tool == 'column_operations' and any(
+24|(str(r.get(side + 'Table', '')).casefold(), str(r.get(side + 'Column', '')).casefold()) == key
+24|for r in relationships for side in ('from', 'to')):
+20|raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+16|for other_tool, rows in inventory.items():
+20|for other_key, other in rows.items():
+24|if other_tool == tool and other_key == key:
+28|continue
+24|refs = dax_references(other.get('expression') or '')
+24|if any(name == key[1] and (table is None or table == key[0]) for table, name in refs):
+28|raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+16|del objects[key]
+16|removed.add(key)
+12|else:
+16|for ref_table, ref_name in dax_references(op.get('expression', '')):
+20|if ref_name == key[1] and (ref_table is None or ref_table == key[0]):
+24|raise ValueError(f'Operacion {index}: posible referencia circular al propio objeto')
+20|if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+24|raise ValueError(f'Operacion {index}: referencia a objeto eliminado previamente: [{ref_name}]')
+20|candidates = [(t, n) for t, n in future if n == ref_name and (ref_table is None or t == ref_table)]
+20|known = any(k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+32|for rows in inventory.values() for k in rows)
+20|if candidates and not known:
+24|raise ValueError(f'Operacion {index}: referencia a objeto creado despues o a si mismo: [{ref_name}]')
+20|if known:
+24|warnings.append(f'Operacion {index}: posible dependencia DAX de [{ref_name}]; se conserva el orden indicado.')
+16|objects[key] = dict(current or {}, **ai_object(op))
+16|if tool == 'column_operations' and operation == 'Create':
+20|objects[key]['columnType'] = 'Calculated'
+12|history.append(operation)
+12|fields = build_object_fields(client, tool, operation, ai_object(op))
+8|root = tool_schema(client, tool)
+8|req = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
+8|unknown = set(fields) - request_schema(client, tool).get('properties', {}).keys()
+8|if unknown:
+12|raise ValueError(f'Operacion {index}: campos no admitidos por el servidor: {sorted(unknown)}')
+8|validate_schema(root, root, req, f'Operacion {index}')
+8|plan.append({'instruction': op, 'tool': tool, 'operation': operation, 'fields': fields})
+4|# Detect indirect cycles among the measure definitions available to preflight.
+4|measures = inventory.get(measure_tool, {})
+4|names = {}
+4|for key in measures:
+8|names.setdefault(key[1], set()).add(key)
+4|graph = {}
+4|for key, obj in measures.items():
+8|refs = dax_references(obj.get('expression') or '')
+8|graph[key] = {other for table, name in refs for other in names.get(name, ())
+22|if table is None or table == other[0]}
+4|touched = {(item['instruction']['table'].casefold(), item['instruction']['name'].casefold())
+15|for item in plan if item['tool'] == measure_tool and item['operation'] != 'Delete'}
+4|# Iterative traversal avoids Python recursion limits for long dependency chains.
+4|done = set()
+4|for start in touched & graph.keys():
+8|stack, active = [(start, False)], set()
+8|while stack:
+12|node, leaving = stack.pop()
+12|if leaving:
+16|active.discard(node)
+16|done.add(node)
+12|elif node in active:
+16|raise ValueError('Posible dependencia circular entre medidas; revisa las expresiones del bloque')
+12|elif node not in done:
+16|active.add(node)
+16|stack.append((node, True))
+16|stack.extend((child, False) for child in graph.get(node, ()))
+4|return plan, list(dict.fromkeys(warnings))
+0|
+0|
+0|def execute_ai_plan(client, plan):
+4|"""No retries, no reordering and no promised rollback; stop at first failure."""
+4|connection = client.connection_name
+4|results = []
+4|for index, item in enumerate(plan, 1):
+8|op, tool, operation = item['instruction'], item['tool'], item['operation']
+8|try:
+12|if client.connection_name != connection or not ensure_connected(client) or client.connection_name != connection:
+16|raise RuntimeError('Conexion cambiada o perdida; lote detenido')
+12|value = request_call(client, tool, operation, **item['fields'])
+12|if tool == 'dax_query_operations':
+16|rows = dax_rows(value)
+16|display_grid(rows)
+16|if len(rows) >= item['fields'].get('maxRows', 1000):
+20|print('Se alcanzo el limite de filas; el resultado puede estar truncado.')
+12|elif not verify_write(client, tool, operation, ai_object(op)):
+16|raise RuntimeError('Resultado no confirmado por lectura; revisa el modelo antes de reintentar')
+12|print(f'[{index}/{len(plan)}] Correcta: {AI_LABELS[op["action"]]} ' + op.get('name', 'consulta'))
+12|results.append({'index': index, 'action': op['action'], 'status': 'correcta'})
+8|except (ValueError, RuntimeError, TimeoutError, OSError, KeyError, TypeError) as exc:
+12|invalidate_on_error(client, exc)
+12|print(f'[{index}/{len(plan)}] ERROR: {exc}')
+12|results.append({'index': index, 'action': op['action'], 'status': 'fallida', 'error': str(exc)})
+12|break
+4|skipped = len(plan) - len(results)
+4|print('\nRESULTADO FINAL')
+4|print('Correctas:', sum(r['status'] == 'correcta' for r in results))
+4|print('Fallidas:', sum(r['status'] == 'fallida' for r in results))
+4|print('No ejecutadas:', skipped)
+4|for row in results:
+8|if row.get('error'):
+12|print(f'Detalle del error [{row["index"]}]: {row["error"]}')
+4|return results
+0|
+0|
+0|def ai_block(client):
+4|if not ensure_connected(client):
+8|return []
+4|print('Pega el bloque JSON generado por IA. Escribe FIN en una linea independiente para terminar:')
+4|lines = []
+4|while True:
+8|line = input()
+8|if line.strip() == 'FIN':
+12|break
+8|lines.append(line)
+4|operations = parse_ai_block('\n'.join(lines))
+4|print('Validando instrucciones...')
+4|plan, warnings = validate_ai_block(client, operations)
+4|print('\nModelo de destino:', client.model_name)
+4|counts = {}
+4|for item in plan:
+8|action = item['instruction']['action']
+8|counts[action] = counts.get(action, 0) + 1
+4|print('Operaciones detectadas:')
+4|for action, count in counts.items():
+8|print(f'- {AI_LABELS[action]}: {count}')
+4|print('Total:', len(plan), 'operaciones')
+4|print('Vista previa completa en orden:')
+4|for i, item in enumerate(plan, 1):
+8|op = item['instruction']
+8|print(f'{i}. {AI_LABELS[op["action"]]} ' + (f'{op["table"]}[{op["name"]}]' if 'name' in op else 'consulta DAX'))
+4|for warning in warnings:
+8|print('AVISO:', warning)
+4|print('El analisis DAX es aproximado; no detecta todas las dependencias de visuales o del modelo.')
+4|if input('¿Deseas ver expresiones y propiedades completas? (s/N): ').strip().lower() == 's':
+8|pretty([item['instruction'] for item in plan])
+4|if any(item['operation'] != 'Execute' for item in plan):
+8|print('Guarda copia del PBIX. No hay transaccion global ni reversion automatica; los cambios completados pueden permanecer.')
+4|if any(item['operation'] == 'Delete' for item in plan):
+8|print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
+4|if input('Escribe CONFIRMAR para ejecutar el bloque completo: ').strip() != 'CONFIRMAR':
+8|print('Cancelado')
+8|return []
+4|return execute_ai_plan(client, plan)
+0|
+0|
+0|def advanced(client):
+4|print('\nHerramientas disponibles:')
+4|for name in client.tools:
+8|print('-', name)
+4|name = input('Herramienta (Enter=cancelar): ').strip()
+4|if not name:
+8|return
+4|schema = tool_schema(client, name)
+4|pretty(schema)
+4|if input('Ejecutar manualmente? (s/N): ').lower() != 's':
+8|return
+4|if not client.writable:
+8|print('Modo solo lectura: operaciones de escritura bloqueadas por el cliente y servidor.')
+4|print('Pega un objeto JSON completo y escribe FIN en una linea aparte:')
+4|lines = []
+4|while True:
+8|line = input()
+8|if line.strip() == 'FIN':
+12|break
+8|lines.append(line)
+4|args = json.loads('\n'.join(lines))
+4|if not isinstance(args, dict):
+8|raise ValueError('Se requiere un objeto JSON')
+4|request = args.get('request')
+4|if not isinstance(request, dict):
+8|raise ValueError('Se requiere un objeto request')
+4|if name != 'connection_operations' and request.get('operation') != 'Help':
+8|if not ensure_connected(client):
+12|return
+8|props = request_schema(client, name).get('properties', {})
+8|if 'connectionName' not in props:
+12|raise RuntimeError('Esta herramienta no permite indicar la conexion explicitamente')
+8|if request.get('connectionName') not in (None, client.connection_name):
+12|raise RuntimeError('La conexion indicada no coincide con el modelo activo')
+8|request['connectionName'] = client.connection_name
+4|enforce_policy(client, name, args)
+4|if args.get('request', {}).get('operation') == 'Delete':
+8|print('Posibles dependencias afectadas. Guarda una copia del PBIX.')
+8|if input('Escribe CONFIRMAR para eliminar: ').strip() != 'CONFIRMAR':
+12|return
+4|elif input('Ejecutar? (s/N): ').strip().lower() != 's':
+8|return
+4|validate_schema(schema, schema, args, 'arguments')
+4|try:
+8|pretty(client.tool(name, args))
+4|finally:
+8|if name == 'connection_operations' and args.get('request', {}).get('operation') not in ('Help', 'ListConnections', 'ListLocalInstances', 'GetConnection'):
+12|client.connection_name = client.model_name = client.instance = None
+12|print('Selecciona de nuevo el modelo desde la opcion 1 para sincronizar el menu.')
+0|
+0|
+0|def main():
+4|parser = argparse.ArgumentParser(description='Cliente de consola Power BI MCP (biblioteca estandar)')
+4|parser.add_argument('--write', action='store_true', help='Habilitar edicion')
+4|parser.add_argument('--debug', action='store_true', help='Mostrar respuestas MCP completas')
+4|parser.add_argument('--server', type=Path, help='Ejecutable autorizado (opcional)')
+4|opts = parser.parse_args()
+4|if opts.write:
+8|print('MODO EDICION. Haz copia del PBIX antes de modificarlo.')
+8|if input('Escribe EDITAR para continuar: ').strip() != 'EDITAR':
+12|return
+4|else:
+8|print('SOLO LECTURA. Para editar: python cliente.py --write')
+4|client = MCP(opts.write, opts.server, opts.debug)
+4|try:
+8|try:
+12|connect(client)
+8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+12|print('ERROR:', exc)
+8|while True:
+12|print('\n========== POWER BI MCP ==========')
+12|print('Modelo:', client.model_name or 'SIN CONEXION')
+12|print('Estado:', 'CONECTADO (ultima verificacion)' if client.connection_name else 'SIN CONEXION')
+12|print('Modo:', 'EDICION' if client.writable else 'LECTURA')
+12|print('1. Conectar / cambiar modelo')
+12|print('2. Listar tablas')
+12|print('3. Listar medidas')
+12|print('4. Crear medidas')
+12|print('5. Modificar medidas')
+12|print('6. Eliminar medidas')
+12|print('7. Crear columnas')
+12|print('8. Modificar columnas')
+12|print('9. Eliminar columnas')
+12|print('10. Consultar relaciones')
+12|print('11. Ejecutar consulta DAX')
+12|print('12. Herramienta avanzada')
+12|print('13. Ejecutar bloque de instrucciones de IA')
+12|print('0. Salir')
+12|choice = input('Opcion: ').strip()
+12|if choice == '0':
+16|break
+12|try:
+16|if choice == '1':
+20|connect(client)
+16|elif choice == '2':
+20|simple_list(client, 'table_operations', 'TABLAS')
+16|elif choice == '3':
+20|simple_list(client, 'measure_operations', 'MEDIDAS')
+16|elif choice in ('4', '5', '6'):
+20|operation = {'4': 'Create', '5': 'Update', '6': 'Delete'}[choice]
+20|edit_objects(client, 'measure_operations', operation, 'MEDIDAS')
+16|elif choice in ('7', '8', '9'):
+20|operation = {'7': 'Create', '8': 'Update', '9': 'Delete'}[choice]
+20|edit_objects(client, 'column_operations', operation, 'COLUMNAS')
+16|elif choice == '10':
+20|simple_list(client, 'relationship_operations', 'RELACIONES')
+16|elif choice == '11':
+20|dax_query(client)
+16|elif choice == '12':
+20|advanced(client)
+16|elif choice == '13':
+20|ai_block(client)
+16|else:
+20|print('Opcion invalida')
+12|except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
+16|print('ERROR:', exc)
+16|invalidate_on_error(client, exc)
+12|if choice != '0':
+16|input('\nEnter para volver al menu...')
+4|finally:
+8|client.close()
+0|
+0|if __name__ == '__main__':
+4|try:
+8|main()
+4|except (KeyboardInterrupt, EOFError):
+8|print('\nSesion finalizada.')
+4|except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+8|print('ERROR:', exc)
+8|sys.exit(1)
+0|
