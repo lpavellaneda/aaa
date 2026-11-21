@@ -1,10 +1,18 @@
-
 EVALUATE
 ROW(
-    "Fact_Sin_Dim", [DIAG_01_Series_Fact_Sin_Dim],
-    "Vol_Sin_Dim", [DIAG_02_Series_Vol_Sin_Dim],
-    "Fact_Blank", [DIAG_03_Filas_Fact_Serie_Blank],
-    "Vol_Blank", [DIAG_04_Filas_Vol_Serie_Blank],
-    "Blank_Automatico_Dim", [DIAG_05_Blank_Automatico_Dim],
-    "Series_No_Encontradas", [DIAG_06_Ejemplos_Series_Sin_Dim]
+    "Filas Facturación SIN SERIE",
+    CALCULATE(
+        COUNTROWS('Facturación'),
+        'Facturación'[Serie] = "SIN SERIE"
+    ),
+    "Filas DimImpresoras SIN SERIE",
+    CALCULATE(
+        COUNTROWS('DimImpresoras'),
+        'DimImpresoras'[Serie] = "SIN SERIE"
+    ),
+    "Filas Volumen SIN SERIE",
+    CALCULATE(
+        COUNTROWS('Volumen'),
+        'Volumen'[Serie] = "SIN SERIE"
+    )
 )
