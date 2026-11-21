@@ -46,7 +46,7 @@ def run(model):
                       obj('delete_column', col2), obj('delete_column', col1)]
         created = [(tool, {'tableName': table, 'name': name}) for tool, names in
                    ((tools[0], (m1, m2)), (tools[1], (col1, col2))) for name in names]
-        lines = [json.dumps({'operations': operations}), 'FIN', 'n', 'CONFIRMAR']
+        lines = [json.dumps({'operations': operations}), 'FIN']
         with patch('builtins.input', side_effect=lines):
             results = c.ai_block(client)
         if len(results) != 11 or any(r['status'] != 'correcta' for r in results):
@@ -54,7 +54,7 @@ def run(model):
         if snapshot() != before:
             raise AssertionError('El inventario final no coincide con el inicial')
         report.update(verified=True, operations=11, writes=10, queries=1,
-                      confirmation='unica', verification='List/Get despues de cada escritura',
+                      confirmation='ninguna (--write)', verification='List/Get despues de cada escritura',
                       temporaryObjectsRemoved=True)
     finally:
         try:
