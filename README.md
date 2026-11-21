@@ -4,7 +4,103 @@ Cliente de consola refactorizado a partir de `cliente_powerbi.py`, con Python 3.
 y exclusivamente su biblioteca estándar. No utiliza Node.js, npm, pip ni servicios
 de IA para funcionar. Necesita el servidor MCP de Microsoft instalado por separado.
 
-## Versión actual: --write sin confirmaciones y reconexión segura
+## Validación DAX con datos, relaciones y columnas calculadas
+
+La versión actual conserva el modo automático de `--write` y añade correcciones
+en el análisis de dependencias, la identificación de errores posteriores a Commit
+y el procesamiento de columnas calculadas. Todo el desarrollo y las pruebas se
+realizaron en la PC de trabajo con el ejecutable de la extensión de VS Code.
+
+### Correcciones verificadas
+
+- `VAR ... RETURN [Medida]` ya no se interpreta como una tabla llamada RETURN.
+  El escáner distingue palabras de control de tablas entre comillas. Esto permite
+  detectar referencias posteriores, ciclos y eliminaciones de dependencias nuevas
+  del mismo bloque. No se eliminó la comprobación de dependencias.
+- Una columna calculada no se considera utilizable solo porque Get devuelva su
+  expresión. Se agrupan las tablas con columnas afectadas y se solicita
+  `table_operations.RefreshWithXMLA` con `refreshType: Calculate`. No se solicita
+  una recarga Full de los datos importados.
+- En bloques solo de escrituras, Calculate se realiza después de Commit. En
+  bloques mixtos, se hace antes de la consulta DAX que necesita las columnas y al
+  terminar si siguen pendientes. Se ejecuta una consulta al motor que obliga a
+  acceder a su almacenamiento; un estado de metadatos por sí solo no prueba que
+  la columna contenga datos procesados.
+- La recuperación por compensación recalcula las columnas que restauró y verifica
+  que puedan consultarse. Si la expresión se restauró pero los datos siguen sin
+  poder evaluarse, la recuperación se informa como incompleta.
+- Los errores semánticos detectados después de Commit identifican el objeto y la
+  última operación que lo afectó. Esa operación se marca fallida y no se cuenta el
+  mismo error dos veces. Un error global de Commit sin objeto identificado se
+  presenta como error global, sin inventar una operación causal.
+
+Calculate puede recalcular otras columnas calculadas de la tabla afectada, además
+de las creadas por el bloque. El respaldo sigue siendo de objetos y no de todo el
+proyecto o de todas las filas. No se promete reversión integral de informes, datos
+de origen o metadatos complejos no cubiertos por las pruebas.
+
+### Suite real reutilizable
+
+```powershell
+$env:PBI_MODELING_MCP_ACCEPT_EULA="true"
+python tests/live_complex_model.py --modelo "Titulo del modelo" --confirmar-escrituras
+```
+
+El argumento adicional pertenece al script de pruebas destructivas, no al uso
+normal de la opción 13. En el cliente el flujo sigue siendo `--write`, elegir el
+modelo, opción 13, JSON y FIN, sin confirmaciones adicionales.
+
+El script inspecciona tablas, columnas, tipos, medidas y relaciones. Escoge una
+relación activa muchos-a-uno con datos y columnas numéricas, otra tabla numérica y
+una dimensión apropiada. No contiene nombres fijos de tablas o columnas de un
+modelo particular. Si el modelo no reúne esos requisitos, se detiene con el
+motivo; no inventa nombres ni presenta pruebas omitidas como exitosas.
+
+Se probaron SUM, AVERAGE, COUNTROWS, DISTINCTCOUNT, CALCULATE, FILTER, ALL,
+REMOVEFILTERS, VAR/RETURN, DIVIDE, SUMX y RELATED. Incluye referencias entre medidas
+alojadas en tablas distintas, modificación de una base con dependientes y columnas
+con medidas dependientes. Los importes se eligen con moneda compatible cuando los
+nombres del modelo la identifican; los chequeos estructurales no se presentan
+como indicadores financieros validados para decisiones de negocio.
+
+Los valores esperados se contrastan con totales del modelo y agrupaciones cuyo
+resultado se agrega también en Python. Se comprueba la cobertura del conteo de
+filas y se rechazan verificaciones truncadas. Las cantidades de tipo Double se
+comparan con tolerancia relativa 1e-12 y absoluta 1e-6. Después de cada bloque se
+abre un lector MCP nuevo para verificar persistencia tras Commit, expresiones y
+estados; después de errores también se comparan todos los objetos respaldados.
+Los resultados numéricos comprueban filtros de dimensión, ALL/REMOVEFILTERS,
+RELATED, medidas dependientes y datos de columnas procesadas.
+
+### Resultado de la validación principal
+
+- **135 pruebas automatizadas aprobadas:** las 119 anteriores y 16 regresiones nuevas.
+- **31 casos reales aprobados:** bloques de 10, 20 y 50 operaciones, más los casos
+  de dependencias, cálculo, errores, recuperación y limpieza.
+- **101 comparaciones numéricas** y **20 objetos recuperados** comprobados desde
+  lectores MCP nuevos, adicionales al conteo de casos.
+- **10 casos negativos esperados:** cuatro rechazos previos sin escrituras y seis
+  bloques con error intencional y recuperación verificada.
+- Cero fallos inesperados en la ejecución final. Durante el desarrollo se
+  reprodujeron y corrigieron la dependencia omitida tras RETURN y las columnas
+  existentes pero aún sin datos procesados. Los reensayos no se cuentan como
+  pruebas distintas en el total principal de **166 casos**.
+
+El informe local `resultado_modelo_complejo.json` contiene las tablas y columnas
+efectivamente elegidas, fórmulas, resultados esperados/observados, errores,
+operaciones y limpieza. Se excluye de Git para no publicar el contenido del modelo.
+El paquete de entrega incluye ese informe para el usuario. El código y la suite
+genérica sí se publican en el repositorio.
+
+La limpieza eliminó solo los objetos con el identificador único del ensayo y
+comprobó el inventario original de medidas, columnas y relaciones. No se guardó
+ni reabrió el PBIP/PBIX. No se ejecutaron pruebas en la otra laptop. Esa laptop
+solo necesita reemplazar cliente.py; se conservan su extensión de VS Code, sus
+variables de entorno y sus respaldos. codigo.txt debe actualizarse si se utiliza
+el formato de transferencia. README.md y tests/ son opcionales para ejecución.
+
+
+## --write sin confirmaciones y reconexión segura
 
 Para actualizar otra laptop basta con reemplazar **cliente.py** por la versión
 actual de la rama main. Es un único archivo y solo utiliza la biblioteca estándar.
@@ -71,7 +167,7 @@ Una transacción anterior sin cierre confirmado impide iniciar otro bloque.
 
 ### Pruebas de esta corrección
 
-Pasaron **119 pruebas automatizadas**. Entre las nuevas: flujo real de main sin
+La corrección de conexión pasó **119 pruebas automatizadas**, incluidas en las 135 actuales. Entre ellas: flujo real de main sin
 EDITAR, ninguna pregunta después de FIN, escritura deshabilitada sin --write,
 título cambiado, PID/puerto como texto, fechas UTC equivalentes, fecha opcional
 ausente, proceso/puerto/base distintos, pérdida de alias, sesión cambiada durante
@@ -317,7 +413,7 @@ medidas pendientes de Commit; y fórmulas inválidas guardadas como SemanticErro
 También se separó el estado final del bloque de los contadores individuales para
 que un fallo de Commit no aparezca como éxito global.
 
-La versión anterior de recuperación pasó **98 pruebas automatizadas**, incluidas actualmente en las 119: casos de respaldo,
+La versión anterior de recuperación pasó **98 pruebas automatizadas**, incluidas actualmente en las 135: casos de respaldo,
 transacción, compensación, errores de guardado, cierre/confirmación fallidos,
 recuperación incompleta, inferencia de tipo y errores semánticos. Los casos de
 disco lleno o servidor inaccesible son simulados; no se afirma haber provocado
@@ -475,7 +571,7 @@ python codificar.py cliente.py codigo.txt
 ```
 
 La primera versión de bloques pasó **84 pruebas automatizadas**, incluidas las 51 de regresión del cliente
-anterior y 33 nuevas para bloques. La versión actual pasa 119. Se cubren creación individual, 300 creaciones,
+anterior y 33 nuevas para bloques. La versión actual pasa 135. Se cubren creación individual, 300 creaciones,
 modificaciones y eliminaciones múltiples, mezcla de acciones, tablas diferentes,
 JSON inválido y claves duplicadas, listas permitidas, conflictos, conexiones,
 confirmación única, dependencias, columnas importadas, respuestas MCP vacías,
@@ -576,7 +672,7 @@ Pruebas automatizadas sin Power BI ni dependencias externas:
 python -m unittest discover -s tests -v
 ```
 
-Las 51 pruebas iniciales de regresión se conservan dentro de las 119 actuales. Simulan selección y cambio de modelos, respuestas de conexión en ambos
+Las 51 pruebas iniciales de regresión se conservan dentro de las 135 actuales. Simulan selección y cambio de modelos, respuestas de conexión en ambos
 formatos, conexiones cerradas y puertos reutilizados, lectura, filtros, estructuras
 MCP anidadas, solicitudes con los esquemas reales, escritura bloqueada,
 confirmaciones, edición y eliminación múltiple, errores parciales, plazos,
