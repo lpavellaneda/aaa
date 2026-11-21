@@ -1,0 +1,2047 @@
+{
+  "connection_operations": {
+    "name": "connection_operations",
+    "title": "Connection Operations",
+    "description": "Perform operations on Microsoft tabular semantic model data source connections (PowerBI Desktop, Analysis Services, Fabric). Supported operations: Help, Connect, ConnectFabric, ConnectFolder, ConnectBimFile, Disconnect, GetConnection, ListConnections, ListLocalInstances. Use the Operation parameter to specify which operation to perform.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "description": "Help, Connect, ConnectFabric, ConnectFolder, ConnectBimFile, Disconnect, GetConnection, ListConnections, ListLocalInstances",
+              "type": "string"
+            },
+            "connectionName": {
+              "description": "Required for GetConnection. Optional for Disconnect (disconnects all if omitted). Forbidden for Connect, ConnectFabric, ConnectFolder, ConnectBimFile (auto-generated)",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "connectionString": {
+              "description": "Required for Connect. Supports PowerBI Desktop, XML/A, Analysis Services",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dataSource": {
+              "description": "e.g. localhost:<port>, powerbi://api.powerbi.com/v1.0/myorg/workspace, server.domain.com",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "initialCatalog": {
+              "description": "Dataset or database name",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspaceName": {
+              "description": "Required for ConnectFabric name-based connections, exact match. Must be supplied with SemanticModelName.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "semanticModelName": {
+              "description": "Required for ConnectFabric name-based connections, exact match. Must be supplied with WorkspaceName.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspaceId": {
+              "description": "Required for ConnectFabric ID-based connections. Must be a GUID and supplied with SemanticModelId",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "semanticModelId": {
+              "description": "Required for ConnectFabric ID-based connections. Must be a GUID and supplied with WorkspaceId",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tenantName": {
+              "description": "For ConnectFabric B2B/guest scenarios. Default: 'myorg'",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "clearCredential": {
+              "description": "Forces fresh authentication",
+              "type": "boolean"
+            },
+            "folderPath": {
+              "description": "For ConnectFolder. Must contain database.tmdl or have 'definition' subfolder",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bimFilePath": {
+              "description": "For ConnectBimFile. Path to .bim file",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "Connection Operations",
+      "readOnlyHint": true
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  },
+  "table_operations": {
+    "name": "table_operations",
+    "title": "Table Operations",
+    "description": "Perform operations on semantic model tables. All operations support both single and multiple items via list properties. Supported operations: Help, Create, CreateFieldParameter, Update, Delete, Get, List, RefreshWithXMLA, RefreshWithAPI, CheckStatusOfRefreshWithAPI, CancelRefreshWithAPI, Rename, MarkAsDateTable, GetSchema, ExportTMDL, ExportTMSL. For Create and Update use Definitions, for Delete, Get, Refresh, GetSchema, ExportTMDL, and ExportTMSL use References, and for Rename use RenameDefinitions. Batch options allow control over transaction behavior and error handling.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "connectionName": {
+              "description": "Uses the last connection if omitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operation": {
+              "description": "Help, Create, CreateFieldParameter, Update, Delete, Get, List, RefreshWithXMLA, RefreshWithAPI, CheckStatusOfRefreshWithAPI, CancelRefreshWithAPI, Rename, MarkAsDateTable, GetSchema, ExportTMDL, ExportTMSL",
+              "type": "string"
+            },
+            "definitions": {
+              "description": "For Create and Update operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "daxExpression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "mExpression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sqlQuery": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "entityName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "schemaName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "expressionSourceName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataSourceName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "partitionName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "mode": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "columns": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "tableName": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "name": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sourceColumn": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "expression": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "dataType": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "dataCategory": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "formatString": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "summarizeBy": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "defaultLabel": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "defaultImage": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "isHidden": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "isUnique": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "isKey": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "isNullable": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "displayFolder": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sortByColumn": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sourceProviderType": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "description": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "isAvailableInMDX": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "stringIndexingBehavior": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "fullTextIndexingBehavior": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "alignment": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "tableDetailPosition": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "annotations": {
+                          "type": [
+                            "array",
+                            "null"
+                          ],
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "key": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "value": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "value"
+                            ]
+                          }
+                        },
+                        "extendedProperties": {
+                          "type": [
+                            "array",
+                            "null"
+                          ],
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "alternateOf": {
+                          "type": [
+                            "object",
+                            "null"
+                          ],
+                          "properties": {
+                            "baseTable": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "baseColumn": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "summarization": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "annotations": {
+                              "type": "array",
+                              "items": {
+                                "$ref": "#/properties/request/properties/definitions/items/properties/columns/items/properties/annotations/items"
+                              }
+                            }
+                          }
+                        },
+                        "expressionContext": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "groupByColumns": {
+                          "type": [
+                            "array",
+                            "null"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "lineageTag": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sourceLineageTag": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataCategory": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "isHidden": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "showAsVariationsOnly": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isPrivate": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "alternateSourcePrecedence": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "excludeFromModelRefresh": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "directLakeIndexingBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "excludeFromAutomaticAggregations": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "refreshPolicy": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "policyType": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "mode": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "rollingWindowGranularity": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "rollingWindowPeriods": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "incrementalGranularity": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "incrementalPeriods": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "incrementalPeriodsOffset": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "pollingExpression": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "sourceExpression": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "annotations": {
+                        "type": [
+                          "array",
+                          "null"
+                        ],
+                        "items": {
+                          "$ref": "#/properties/request/properties/definitions/items/properties/columns/items/properties/annotations/items"
+                        }
+                      },
+                      "extendedProperties": {
+                        "type": [
+                          "array",
+                          "null"
+                        ],
+                        "items": {
+                          "$ref": "#/properties/request/properties/definitions/items/properties/columns/items/properties/extendedProperties/items"
+                        }
+                      }
+                    }
+                  },
+                  "lineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceLineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "systemManaged": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "annotations": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "$ref": "#/properties/request/properties/definitions/items/properties/columns/items/properties/annotations/items"
+                    }
+                  },
+                  "extendedProperties": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "$ref": "#/properties/request/properties/definitions/items/properties/columns/items/properties/extendedProperties/items"
+                    }
+                  }
+                }
+              }
+            },
+            "references": {
+              "description": "For Delete and Get operations; single item for RefreshWithXMLA, GetSchema, ExportTMDL, and ExportTMSL.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            },
+            "renameDefinitions": {
+              "description": "For Rename operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "currentName": {
+                    "type": "string"
+                  },
+                  "newName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "currentName",
+                  "newName"
+                ]
+              }
+            },
+            "tmdlExportOptions": {
+              "description": "For ExportTMDL operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "serializationOptions": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "includeChildren": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeInferredDataTypes": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeRestrictedInformation": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "maxReturnCharacters": {
+                  "description": "Maximum characters to return (-1=no limit, 0=don't return, >0=limit). Default: 10000",
+                  "type": "integer"
+                }
+              }
+            },
+            "tmslExportOptions": {
+              "description": "For ExportTMSL operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "tmslOperationType": {
+                  "description": "Create, CreateOrReplace, Alter, Delete, Refresh",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "refreshType": {
+                  "description": "Full, ClearValues, Calculate, DataOnly, Automatic, Add, Defragment. For Refresh only",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "includeRestricted": {
+                  "description": "Default: false",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "formatJson": {
+                  "description": "Default: true",
+                  "type": "boolean"
+                },
+                "maxReturnCharacters": {
+                  "description": "Maximum characters to return (-1=no limit, 0=don't return, >0=limit). Default: 10000",
+                  "type": "integer"
+                }
+              }
+            },
+            "markAsDateTableDefinitions": {
+              "description": "For MarkAsDateTable operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "type": "string"
+                  },
+                  "dateColumnName": {
+                    "description": "Auto-detected if omitted",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "tableName"
+                ]
+              }
+            },
+            "fieldParameterDefinitions": {
+              "description": "For CreateFieldParameter operation. List of field parameter table definitions, each with Name and Fields (ordered list of column/measure references with TableName, Name, ObjectType, and optional DisplayName).",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "fields": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "tableName": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "objectType": {
+                          "type": "string"
+                        },
+                        "displayName": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "objectType"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "name",
+                  "fields"
+                ]
+              }
+            },
+            "shouldCascadeDelete": {
+              "description": "For Delete operation. Default: true.",
+              "type": "boolean"
+            },
+            "refreshType": {
+              "description": "For RefreshWithAPI operation: refresh type — Automatic, Full, DataOnly, Calculate.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requestId": {
+              "description": "For CheckStatusOfRefreshWithAPI operation: the request ID returned by RefreshWithAPI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options": {
+              "description": "Batch operation options such as ContinueOnError and UseTransaction.",
+              "type": "object",
+              "properties": {
+                "continueOnError": {
+                  "type": "boolean"
+                },
+                "useTransaction": {
+                  "description": "Default: true",
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "Table Operations",
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  },
+  "measure_operations": {
+    "name": "measure_operations",
+    "title": "Measure Operations",
+    "description": "Perform operations on semantic model measures. All operations support both single and multiple items via list properties. Supported operations: Help, Create, Update, Delete, Get, List, Rename, Move, ExportTMDL. For Create and Update use Definitions. For Delete, Get, List, and ExportTMDL use References. For Rename use RenameDefinitions. For Move use MoveDefinitions. To move measures between tables, use the Move operation. Update operation cannot change table assignment; use Move instead. Batch options allow control over transaction behavior and error handling.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "connectionName": {
+              "description": "Uses the last connection if omitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operation": {
+              "description": "Help, Create, Update, Delete, Get, List, Rename, Move, ExportTMDL",
+              "type": "string"
+            },
+            "definitions": {
+              "description": "For Create and Update operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "expression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "formatString": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "isHidden": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isSimpleMeasure": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "displayFolder": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataType": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataCategory": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "lineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceLineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "kpi": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "detailRowsExpression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "formatStringExpression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "annotations": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "key": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "value": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "value"
+                      ]
+                    }
+                  },
+                  "extendedProperties": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "state": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "errorMessage": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "modifiedTime": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "format": "date-time"
+                  },
+                  "structureModifiedTime": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            },
+            "references": {
+              "description": "For Delete, Get, and ExportTMDL operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "tableName": {
+                    "description": "Optional if measure name is unique",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            },
+            "filter": {
+              "description": "For List operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "tableNames": {
+                  "description": "Matches any specified table",
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "displayFolders": {
+                  "description": "Case-insensitive, matches any specified folder",
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "maxResults": {
+                  "description": "Default: 200",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "shouldCascadeDelete": {
+              "description": "For Delete operation. Default: true.",
+              "type": "boolean"
+            },
+            "renameDefinitions": {
+              "description": "For Rename operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "description": "Optional if measure name is unique",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currentName": {
+                    "type": "string"
+                  },
+                  "newName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "currentName",
+                  "newName"
+                ]
+              }
+            },
+            "moveDefinitions": {
+              "description": "For Move operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "currentTableName": {
+                    "description": "Optional if measure name is unique",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "destinationTableName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "destinationTableName"
+                ]
+              }
+            },
+            "tmdlExportOptions": {
+              "description": "For ExportTMDL operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "serializationOptions": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "includeChildren": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeInferredDataTypes": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeRestrictedInformation": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "maxReturnCharacters": {
+                  "description": "Maximum characters to return (-1=no limit, 0=don't return, >0=limit). Default: 10000",
+                  "type": "integer"
+                }
+              }
+            },
+            "options": {
+              "description": "Batch operation options such as ContinueOnError and UseTransaction.",
+              "type": "object",
+              "properties": {
+                "continueOnError": {
+                  "type": "boolean"
+                },
+                "useTransaction": {
+                  "description": "Default: true",
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "Measure Operations",
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  },
+  "column_operations": {
+    "name": "column_operations",
+    "title": "Column Operations",
+    "description": "Perform operations on semantic model columns. All operations support both single and multiple items via list properties. Supported operations: Help, Create, Update, Delete, Get, List, Rename, ExportTMDL. Use the Operation parameter to specify which operation to perform. For Create and Update use Definitions, for Delete, Get, List, and ExportTMDL use References, and for Rename use RenameDefinitions. Batch options allow control over transaction behavior and error handling.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "connectionName": {
+              "description": "Uses the last connection if omitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operation": {
+              "description": "Help, Create, Update, Delete, Get, List, Rename, ExportTMDL",
+              "type": "string"
+            },
+            "definitions": {
+              "description": "For Create and Update operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceColumn": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "expression": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataType": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dataCategory": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "formatString": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "summarizeBy": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "defaultLabel": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "defaultImage": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isHidden": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isUnique": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isKey": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "isNullable": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "displayFolder": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sortByColumn": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceProviderType": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "isAvailableInMDX": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "stringIndexingBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "fullTextIndexingBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "alignment": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tableDetailPosition": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "annotations": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "key": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "value": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "value"
+                      ]
+                    }
+                  },
+                  "extendedProperties": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "alternateOf": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "baseTable": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "baseColumn": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "summarization": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "annotations": {
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/properties/request/properties/definitions/items/properties/annotations/items"
+                        }
+                      }
+                    }
+                  },
+                  "expressionContext": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "groupByColumns": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "lineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceLineageTag": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            },
+            "references": {
+              "description": "For Delete, Get, and ExportTMDL operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tableName",
+                  "name"
+                ]
+              }
+            },
+            "filter": {
+              "description": "For List operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "tableNames": {
+                  "description": "Matches any specified table",
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "displayFolders": {
+                  "description": "Case-insensitive, matches any specified folder",
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "maxResults": {
+                  "description": "Default: 200",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "shouldCascadeDelete": {
+              "description": "Whether dependent objects should be deleted when deleting a column. Default: true.",
+              "type": "boolean"
+            },
+            "renameDefinitions": {
+              "description": "For Rename operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tableName": {
+                    "type": "string"
+                  },
+                  "currentName": {
+                    "type": "string"
+                  },
+                  "newName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tableName",
+                  "currentName",
+                  "newName"
+                ]
+              }
+            },
+            "tmdlExportOptions": {
+              "description": "For ExportTMDL operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "serializationOptions": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "includeChildren": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeInferredDataTypes": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeRestrictedInformation": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "maxReturnCharacters": {
+                  "description": "Maximum characters to return (-1=no limit, 0=don't return, >0=limit). Default: 10000",
+                  "type": "integer"
+                }
+              }
+            },
+            "options": {
+              "description": "Batch operation options such as ContinueOnError and UseTransaction.",
+              "type": "object",
+              "properties": {
+                "continueOnError": {
+                  "type": "boolean"
+                },
+                "useTransaction": {
+                  "description": "Default: true",
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "Column Operations",
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  },
+  "relationship_operations": {
+    "name": "relationship_operations",
+    "title": "Relationship Operations",
+    "description": "Perform operations on semantic model relationships. Supported operations: Help, List, Get, Create, Update, Delete, Rename, Activate, Deactivate, Find, ExportTMDL. Use the Operation parameter to specify which operation to perform.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "connectionName": {
+              "description": "Uses the last connection if omitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operation": {
+              "description": "Help, List, Get, Create, Update, Delete, Rename, Activate, Deactivate, Find, ExportTMDL",
+              "type": "string"
+            },
+            "definitions": {
+              "description": "For Create and Update operations.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "isActive": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "type": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "crossFilteringBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "joinOnDateBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "relyOnReferentialIntegrity": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "fromTable": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "fromColumn": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "fromCardinality": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "toTable": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "toColumn": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "toCardinality": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "securityFilteringBehavior": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "annotations": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "key": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "value": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "value"
+                      ]
+                    }
+                  },
+                  "extendedProperties": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "references": {
+              "description": "For Delete, Get, Activate, Deactivate, and ExportTMDL operations; TableName-only for Find operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            },
+            "renameDefinitions": {
+              "description": "For Rename operation.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "currentName": {
+                    "type": "string"
+                  },
+                  "newName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "currentName",
+                  "newName"
+                ]
+              }
+            },
+            "tmdlExportOptions": {
+              "description": "For ExportTMDL operation.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "serializationOptions": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "includeChildren": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeInferredDataTypes": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    },
+                    "includeRestrictedInformation": {
+                      "description": "Default: false",
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "maxReturnCharacters": {
+                  "description": "Maximum characters to return (-1=no limit, 0=don't return, >0=limit). Default: 10000",
+                  "type": "integer"
+                }
+              }
+            },
+            "options": {
+              "description": "Batch operation options such as ContinueOnError and UseTransaction.",
+              "type": "object",
+              "properties": {
+                "continueOnError": {
+                  "type": "boolean"
+                },
+                "useTransaction": {
+                  "description": "Default: true",
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "Relationship Operations",
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  },
+  "dax_query_operations": {
+    "name": "dax_query_operations",
+    "title": "DAX Query Operations",
+    "description": "Perform DAX query operations on semantic models. Supported operations: Help, Execute, Validate, ClearCache. Use the Operation parameter to specify which operation to perform.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "description": "Help, Execute, Validate, ClearCache",
+              "type": "string"
+            },
+            "connectionName": {
+              "description": "Uses the last connection if omitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "description": "DAX query text for Execute and Validate operations.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeoutSeconds": {
+              "description": "Default: 200 seconds for Execute, 10 seconds for Validate.",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "maxRows": {
+              "description": "Execute only. Maximum number of rows to return (default 1000; limit of 100000).",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "getExecutionMetrics": {
+              "description": "Execute only. Captures query execution metrics when true. Default: false.",
+              "type": "boolean"
+            },
+            "executionMetricsOnly": {
+              "description": "When true with GetExecutionMetrics, omits row data but reads all rows for accurate timing. Default: false.",
+              "type": "boolean"
+            },
+            "impersonation": {
+              "description": "Execute only. Optional impersonation options for query execution.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "roles": {
+                  "description": "Security role names to apply via the Roles connection string property.",
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "userPrincipalName": {
+                  "description": "User principal name to impersonate via the EffectiveUserName connection string property.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "resultMode": {
+              "description": "Execute only. Selects how results are returned: 'Resource' (default, embedded resource) or 'Inline'(JSON text) — best for clients that don't support MCP resources.",
+              "type": "string",
+              "enum": [
+                "Resource",
+                "Inline"
+              ]
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ]
+    },
+    "annotations": {
+      "title": "DAX Query Operations",
+      "readOnlyHint": true
+    },
+    "execution": {
+      "taskSupport": "optional"
+    }
+  }
+}
