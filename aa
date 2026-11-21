@@ -1,41 +1,10 @@
 
-{
-  "operations": [
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_01_Series_Fact_Sin_Dim",
-      "expression": "COUNTROWS(EXCEPT(DISTINCT('Facturación'[Serie]), DISTINCT('DimImpresoras'[Serie])))"
-    },
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_02_Series_Vol_Sin_Dim",
-      "expression": "COUNTROWS(EXCEPT(DISTINCT('Volumen'[Serie]), DISTINCT('DimImpresoras'[Serie])))"
-    },
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_03_Filas_Fact_Serie_Blank",
-      "expression": "COUNTROWS(FILTER(ALL('Facturación'), ISBLANK('Facturación'[Serie]) || TRIM('Facturación'[Serie]) = \"\"))"
-    },
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_04_Filas_Vol_Serie_Blank",
-      "expression": "COUNTROWS(FILTER(ALL('Volumen'), ISBLANK('Volumen'[Serie]) || TRIM('Volumen'[Serie]) = \"\"))"
-    },
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_05_Blank_Automatico_Dim",
-      "expression": "COUNTROWS(ALL('DimImpresoras')) - COUNTROWS(ALLNOBLANKROW('DimImpresoras'))"
-    },
-    {
-      "action": "create_measure",
-      "table": "Medidas",
-      "name": "DIAG_06_Ejemplos_Series_Sin_Dim",
-      "expression": "VAR F = EXCEPT(DISTINCT('Facturación'[Serie]), DISTINCT('DimImpresoras'[Serie])) VAR V = EXCEPT(DISTINCT('Volumen'[Serie]), DISTINCT('DimImpresoras'[Serie])) RETURN \"FACT: \" & CONCATENATEX(TOPN(10, F, 'Facturación'[Serie], ASC), 'Facturación'[Serie], \" | \") & \" / VOL: \" & CONCATENATEX(TOPN(10, V, 'Volumen'[Serie], ASC), 'Volumen'[Serie], \" | \")"
-    }
-  ]
-}
+EVALUATE
+ROW(
+    "Fact_Sin_Dim", [DIAG_01_Series_Fact_Sin_Dim],
+    "Vol_Sin_Dim", [DIAG_02_Series_Vol_Sin_Dim],
+    "Fact_Blank", [DIAG_03_Filas_Fact_Serie_Blank],
+    "Vol_Blank", [DIAG_04_Filas_Vol_Serie_Blank],
+    "Blank_Automatico_Dim", [DIAG_05_Blank_Automatico_Dim],
+    "Series_No_Encontradas", [DIAG_06_Ejemplos_Series_Sin_Dim]
+)
