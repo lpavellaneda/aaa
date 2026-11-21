@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timezone
 import csv
 import difflib
 import json
@@ -27,6 +28,15 @@ class MCP:
         server = Path(server) if server else SERVER
         if not server or not server.is_file():
             raise RuntimeError('No se encontro powerbi-modeling-mcp.exe en VS Code')
+        self.server_path = server
+        self.mcp_session_token = uuid.uuid4().hex
+        self.target_identity = None
+        self.last_connection_name = None
+        self.engine_session_id = None
+        self.connection_issue = None
+        self.active_transaction = None
+        self.retired_mcp_sessions = []
+        self.connection_events = []
         args = [str(server), '--start', '--readwrite' if writable else '--readonly']
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, encoding='utf-8',
@@ -36,8 +46,10 @@ class MCP:
         self.connection_name = None
         self.instance = None
         self.model_name = None
-        threading.Thread(target=self._read, daemon=True).start()
-        threading.Thread(target=self._stderr, daemon=True).start()
+        self._reader_thread = threading.Thread(target=self._read, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr, daemon=True)
+        self._reader_thread.start()
+        self._stderr_thread.start()
         try:
             self._initialize()
         except BaseException:
@@ -120,6 +132,21 @@ class MCP:
             params = message.get('params', {})
             print('\nSolicitud de consentimiento del servidor:', params.get('message', ''))
             schema = params.get('requestedSchema', {})
+            if getattr(self, 'writable', False) and getattr(self, '_auto_write_scope', False):
+                props = schema.get('properties', {})
+                sensitive = re.search(r'eula|licen[cs]|password|credential|token|contrase',
+                                      str(params.get('message', '')) + ' ' + ' '.join(props), re.IGNORECASE)
+                consent_fields = all(re.search(r'allow|approv|accept|confirm|consent|proceed|authoriz|permit|autoriz', key, re.IGNORECASE) for key in props)
+                if props and consent_fields and all(spec.get('type') == 'boolean' for spec in props.values()) and not sensitive:
+                    content = {key: True for key in props}
+                    validate_schema(schema, schema, content, 'autorizacion --write')
+                    result = {'action': 'accept', 'content': content}
+                    print('Consentimiento de escritura del servidor autorizado por --write para este bloque.')
+                else:
+                    result = {'action': 'decline'}
+                    print('Solicitud adicional del servidor no compatible con autorizacion automatica; se rechaza sin pedir datos.')
+                self.send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
+                return
             try:
                 content = collect_fields(schema)
                 validate_schema(schema, schema, content, 'consentimiento')
@@ -149,9 +176,30 @@ class MCP:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=3)
+        for thread in (getattr(self, '_reader_thread', None), getattr(self, '_stderr_thread', None)):
+            if thread:
+                thread.join(timeout=2)
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
             if stream:
                 stream.close()
+
+    def restart_transport(self):
+        """Restart a dead MCP process, keeping the selected target, not its session."""
+        if self.process.poll() is None:
+            raise RuntimeError('No se reinicia un proceso MCP vivo con solicitudes posiblemente pendientes')
+        retired = list(self.retired_mcp_sessions) + [self.mcp_session_token]
+        keep = {name: getattr(self, name, None) for name in (
+            'target_identity', 'instance', 'model_name', 'last_connection_name',
+            'backup_dir', 'last_backup_path', 'last_recovery', '_block_active', '_auto_write_scope', 'connection_events')}
+        writable, server, debug = self.writable, self.server_path, self.debug
+        self.close()
+        if any(thread and thread.is_alive() for thread in (self._reader_thread, self._stderr_thread)):
+            raise RuntimeError('Los lectores de la sesion MCP anterior no finalizaron; reconexion detenida')
+        self.__init__(writable=writable, server=server, debug=debug)
+        self.retired_mcp_sessions = retired
+        for name, value in keep.items():
+            if value is not None:
+                setattr(self, name, value)
 
 
 def pretty(value):
@@ -334,11 +382,15 @@ def request_call(client, tool, operation, **fields):
 
 def invalidate_on_error(client, exc):
     message = str(exc).casefold()
-    if isinstance(exc, (TimeoutError, OSError)) or any(word in message for word in (
-            'connection', 'conexion', 'conexión', 'disconnected', 'servidor mcp se cerro', 'not connected')):
+    lost = re.search(r'(?:connection|conexi[oó]n).{0,100}(?:not found|does not exist|closed|lost|invalid|perdida|cerrada|invalida)|'
+                     r'not connected|disconnected|servidor mcp se cerro|proceso mcp termino', message)
+    if isinstance(exc, (TimeoutError, OSError, ConnectionIdentityError)) or lost:
+        if client.connection_name:
+            client.last_connection_name = client.connection_name
+        if not getattr(client, 'target_identity', None) and getattr(client, 'instance', None):
+            client.target_identity = {'instance': dict(client.instance), 'database': None}
         client.connection_name = None
-        client.model_name = None
-        client.instance = None
+        client.connection_issue = str(exc)
 
 
 def data_value(value):
@@ -394,11 +446,110 @@ def choose(items, prompt='Selecciona: ', multiple=False):
     return selected if multiple else selected[0]
 
 
+class ConnectionIdentityError(RuntimeError):
+    pass
+
+
+def normalized_port(value):
+    try:
+        port = int(value)
+        return port if 1 <= port <= 65535 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def normalized_start(value):
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        return stamp.astimezone(timezone.utc).isoformat() if stamp.tzinfo else stamp.isoformat()
+    except ValueError:
+        return None
+
+
+def same_instance(expected, observed):
+    if normalized_port(expected.get('port')) != normalized_port(observed.get('port')):
+        return False
+    for key in ('processId',):
+        if expected.get(key) is not None and observed.get(key) is not None:
+            if str(expected[key]).strip() != str(observed[key]).strip():
+                return False
+    a, b = normalized_start(expected.get('startTime')), normalized_start(observed.get('startTime'))
+    if a and b:
+        # Compare only comparable aware/naive timestamps; database identity remains
+        # mandatory for reconnection if a server omits or changes the time format.
+        aware_a, aware_b = '+' in a[10:] or a.endswith('Z'), '+' in b[10:] or b.endswith('Z')
+        if aware_a == aware_b and a != b:
+            return False
+    return True
+
+
+def connection_details(client, name):
+    if not operation_supported(client, 'connection_operations', 'GetConnection'):
+        return {}
+    result = request_call(client, 'connection_operations', 'GetConnection', connectionName=name)
+    data = data_value(result)
+    if not isinstance(data, dict):
+        raise RuntimeError('GetConnection no devolvio detalles validos de la conexion')
+    return data
+
+
+def check_connection_database(details, identity):
+    database = details.get('databaseId') or details.get('databaseName')
+    expected = identity.get('database')
+    if expected and (not database or str(database).casefold() != str(expected).casefold()):
+        raise ConnectionIdentityError('La base de datos no coincide con el modelo seleccionado; se rechaza la conexion')
+    server = details.get('serverName')
+    if server:
+        match = re.fullmatch(r'(?:localhost|127\.0\.0\.1|\[::1\]|\.|\(local\))[:,](\d+)', str(server).strip(), re.IGNORECASE)
+        if not match or normalized_port(match.group(1)) != normalized_port(identity['instance'].get('port')):
+            raise ConnectionIdentityError('El servidor/puerto de GetConnection no coincide con la instancia seleccionada')
+    if details.get('isConnected') is False:
+        raise RuntimeError('La conexion del servidor esta desconectada')
+    return database
+
+
+def attach_instance(client, instance, expected=None):
+    port = normalized_port(instance.get('port'))
+    if not port:
+        raise ConnectionIdentityError('Puerto de Power BI no valido')
+    # Reconnection is always local, on the exact selected port. No title search,
+    # alternative port, default model or connection string supplied in an AI block.
+    connstr = (f'Data Source=localhost:{port};Application Name=PBIModeling' if expected
+               else instance.get('connectionString') or f'Data Source=localhost:{port};Application Name=PBIModeling')
+    result = request_call(client, 'connection_operations', 'Connect', connectionString=connstr)
+    data = data_value(result)
+    name = data if isinstance(data, str) else data.get('connectionName') if isinstance(data, dict) else None
+    if not name and isinstance(result, dict):
+        name = result.get('connectionName')
+    if not isinstance(name, str) or not name.strip():
+        raise RuntimeError('El servidor no devolvio un identificador de conexion valido')
+    client.connection_name = name
+    identity = expected or {'instance': dict(instance), 'database': None}
+    try:
+        details = connection_details(client, name)
+        database = check_connection_database(details, identity)
+    except (RuntimeError, TimeoutError, OSError):
+        client.connection_name = None
+        raise
+    if not expected:
+        identity['database'] = database
+        client.target_identity = identity
+    client.instance = dict(instance)
+    client.model_name = instance.get('parentWindowTitle') or instance.get('name') or name
+    client.last_connection_name = name
+    client.engine_session_id = details.get('sessionId')
+    client.connection_issue = None
+    return name
+
+
 def connect(client):
     print('\nBuscando modelos de Power BI Desktop...')
     instances = list_instances(client)
     if not instances:
         client.connection_name = client.model_name = client.instance = None
+        client.target_identity = None
         print('No hay modelos abiertos. Abre Power BI Desktop y un archivo PBIX.')
         return
     print('Modelos encontrados:')
@@ -408,47 +559,100 @@ def connect(client):
     inst = choose(instances, 'Selecciona el modelo: ')
     if inst is None:
         return
-    connstr = inst.get('connectionString')
-    if not connstr:
-        port = int(inst['port'])
-        if not 1 <= port <= 65535:
-            raise ValueError('Puerto invalido')
-        connstr = f'Data Source=localhost:{port};Application Name=PBIModeling'
-    # Clear old identity first: even an ambiguous Connect response must not select it.
     client.connection_name = client.model_name = client.instance = None
-    result = request_call(client, 'connection_operations', 'Connect', connectionString=connstr)
-    data = data_value(result)
-    name = data if isinstance(data, str) else data.get('connectionName') if isinstance(data, dict) else None
-    if not name and isinstance(result, dict):
-        name = result.get('connectionName')
-    if not isinstance(name, str) or not name.strip():
-        raise RuntimeError('El servidor no devolvio un identificador de conexion valido')
-    client.connection_name = name
-    client.model_name = inst.get('parentWindowTitle') or inst.get('name') or name
-    client.instance = dict(inst)
+    client.target_identity = None
+    client.last_connection_name = None
+    attach_instance(client, inst)
     print('CONECTADO A:', client.model_name)
 
 
-def ensure_connected(client):
-    if not client.connection_name:
+def selected_target(client):
+    identity = getattr(client, 'target_identity', None)
+    if identity:
+        return identity
+    if client.instance:
+        identity = {'instance': dict(client.instance), 'database': None}
+        client.target_identity = identity
+        return identity
+    return None
+
+
+def same_target(a, b):
+    if not a or not b:
+        return a == b
+    if not same_instance(a['instance'], b['instance']):
+        return False
+    return not a.get('database') or (b.get('database') and str(a['database']).casefold() == str(b['database']).casefold())
+
+
+def ensure_connected(client, allow_reconnect=True, allow_restart=True):
+    identity = selected_target(client)
+    if not client.connection_name and not identity:
         print('Primero selecciona la opcion 1 para conectar.')
         return False
+    issue = None
     try:
-        if client.instance:
+        process = getattr(client, 'process', None)
+        if process is not None and process.poll() is not None:
+            if not allow_restart or not allow_reconnect:
+                raise RuntimeError('El proceso MCP termino; la sesion original ya no esta disponible')
+            if not identity or not identity.get('database'):
+                raise ConnectionIdentityError('No hay identidad de base de datos para reiniciar y reconectar con seguridad')
+            client.restart_transport()
+            issue = 'El proceso MCP termino; se inicio una nueva sesion para el mismo destino'
+        observed = None
+        if identity:
             instances = list_instances(client)
-            if not any(str(i.get('port')) == str(client.instance.get('port')) and
-                       (i.get('parentWindowTitle') or i.get('name')) ==
-                       (client.instance.get('parentWindowTitle') or client.instance.get('name')) and
-                       all(client.instance.get(key) is None or i.get(key) == client.instance[key]
-                           for key in ('processId', 'startTime')) for i in instances):
-                raise RuntimeError('Conexion cerrada: el modelo ya no aparece en Power BI Desktop')
-        if operation_supported(client, 'connection_operations', 'GetConnection'):
-            result = request_call(client, 'connection_operations', 'GetConnection')
-            if data_value(result) is None:
-                raise RuntimeError('Conexion invalida')
+            candidates = [item for item in instances if normalized_port(item.get('port')) == normalized_port(identity['instance'].get('port'))]
+            if len(candidates) != 1 or not same_instance(identity['instance'], candidates[0]):
+                raise ConnectionIdentityError('La instancia seleccionada ya no aparece con el mismo puerto y proceso. No se buscara otro modelo por titulo')
+            observed = candidates[0]
+        if client.connection_name:
+            try:
+                details = connection_details(client, client.connection_name)
+                if identity:
+                    database = check_connection_database(details, identity)
+                    if not identity.get('database') and database:
+                        identity['database'] = database
+                if getattr(client, 'active_transaction', None) and getattr(client, 'engine_session_id', None) and details.get('sessionId') != client.engine_session_id:
+                    raise ConnectionIdentityError('Cambio la sesion del motor durante una transaccion; no se continuara escribiendo')
+                client.last_connection_name = client.connection_name
+                client.engine_session_id = details.get('sessionId') or getattr(client, 'engine_session_id', None)
+                if observed:
+                    client.instance = dict(observed)
+                    client.model_name = observed.get('parentWindowTitle') or client.model_name
+                client.connection_issue = None
+                return True
+            except ConnectionIdentityError:
+                raise
+            except (RuntimeError, TimeoutError, OSError) as exc:
+                issue = str(exc)
+        if not allow_reconnect:
+            raise RuntimeError('No se puede reutilizar la sesion de la transaccion: ' + str(issue or 'conexion perdida'))
+        if not identity or not identity.get('database') or not observed:
+            raise ConnectionIdentityError('No hay identidad suficiente para reconectar automaticamente; selecciona el modelo de nuevo')
+        previous = client.connection_name or getattr(client, 'last_connection_name', None)
+        client.connection_name = None
+        attach_instance(client, observed, expected=identity)
+        client.reconnection_count = getattr(client, 'reconnection_count', 0) + 1
+        if not hasattr(client, 'connection_events'):
+            client.connection_events = []
+        client.connection_events.append({'event': 'reconexion_verificada', 'reason': issue or 'alias no disponible',
+            'port': normalized_port(observed['port']), 'database': identity['database'],
+            'previousAlias': previous, 'currentAlias': client.connection_name,
+            'mcpSession': getattr(client, 'mcp_session_token', None), 'engineSession': getattr(client, 'engine_session_id', None)})
+        client.connection_issue = None
+        print(f'RECONEXION VERIFICADA: mismo modelo, base de datos y puerto {observed["port"]}.')
+        if getattr(client, 'debug', False):
+            print('Diagnostico de reconexion:', issue or 'identificador de conexion perdido', '| alias anterior:', previous, '| alias actual:', client.connection_name)
         return True
     except (RuntimeError, TimeoutError, OSError) as exc:
-        client.connection_name = client.model_name = client.instance = None
+        client.connection_issue = str(exc)
+        if not hasattr(client, 'connection_events'):
+            client.connection_events = []
+        client.connection_events.append({'event': 'conexion_rechazada', 'reason': str(exc),
+                                          'mcpSession': getattr(client, 'mcp_session_token', None)})
+        client.connection_name = None
         print('ERROR: conexion no disponible:', exc)
         return False
 
@@ -1279,6 +1483,8 @@ def create_plan_backup(client, plan):
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / ('bloque_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex + '.json')
     data = {'format': 1, 'model': client.model_name, 'connectionName': client.connection_name,
+            'targetIdentity': selected_target(client), 'mcpSession': getattr(client, 'mcp_session_token', None),
+            'connectionDiagnostics': list(getattr(client, 'connection_events', [])),
             'instance': {key: (client.instance or {}).get(key) for key in ('port', 'processId', 'startTime', 'parentWindowTitle')},
             'status': 'preparado', 'recovery': 'no_necesaria', 'targets': [], 'journal': [],
             'plan': [item['instruction'] for item in plan],
@@ -1363,20 +1569,49 @@ def verify_backup(client, backup):
 def recover_plan(client, path, backup, tx):
     print('\nRECUPERACION: intentando restaurar el estado anterior...')
     recovery_errors = []
+    if not backup['journal']:
+        if tx:
+            try:
+                transaction_request(client, 'Rollback', tx)
+                backup['transactionClosed'] = True
+                client.active_transaction = None
+            except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+                recovery_errors.append('No se pudo confirmar el cierre de la transaccion sin escrituras: ' + str(exc))
+        backup['recovery'] = 'no_necesaria'
+        backup['recoveryErrors'] = recovery_errors
+        save_recovery_file(path, backup)
+        print('No se envio ninguna escritura del bloque; no hay cambios del bloque que deshacer.')
+        for error in recovery_errors:
+            print('AVISO:', error)
+        return not recovery_errors
+    expected_identity = backup.get('targetIdentity')
+    if expected_identity and not same_target(expected_identity, selected_target(client)):
+        backup['recovery'] = 'incompleta'
+        backup['recoveryErrors'] = ['El destino seleccionado cambio; no se modificara otro modelo para recuperar este bloque']
+        save_recovery_file(path, backup)
+        print('RECUPERACION DETENIDA: la identidad del modelo cambio.')
+        return False
     if tx:
+        process = getattr(client, 'process', None)
+        if process is not None and process.poll() is not None:
+            ensure_connected(client, allow_reconnect=True, allow_restart=True)
+        old_token = backup.get('mcpSession')
+        if old_token and old_token != getattr(client, 'mcp_session_token', None):
+            if old_token in getattr(client, 'retired_mcp_sessions', []):
+                backup['transactionClosed'] = True
+                backup['sessionRecovery'] = 'Proceso MCP original terminado; estado inspeccionado desde una nueva sesion'
+            else:
+                recovery_errors.append('No se puede reutilizar transactionId en otra sesion MCP')
         if not backup.get('transactionClosed'):
             try:
                 transaction_request(client, 'Rollback', tx)
                 backup['transactionClosed'] = True
+                client.active_transaction = None
             except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
                 recovery_errors.append('Rollback del servidor: ' + str(exc))
-        # Reuse the same known connection only if the original process and model
-        # are still available; never attach recovery to another Desktop instance.
-        if not client.connection_name and getattr(client, 'process', None) is not None and client.process.poll() is None:
-            client.connection_name = backup['connectionName']
-            client.model_name = backup['model']
-            client.instance = backup['instance']
-            ensure_connected(client)
+        if backup.get('transactionClosed'):
+            client.active_transaction = None
+            ensure_connected(client, allow_reconnect=True, allow_restart=True)
         differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; no se pudo verificar el modelo']
         if not differences and backup.get('transactionClosed'):
             backup['recovery'] = 'verificada'
@@ -1391,7 +1626,8 @@ def recover_plan(client, path, backup, tx):
             save_recovery_file(path, backup)
             print('RECUPERACION NO VERIFICADA. Conserva el respaldo:', path)
             return False
-    if client.connection_name == backup['connectionName'] and ensure_connected(client):
+    if ensure_connected(client, allow_reconnect=True, allow_restart=True) and (
+            same_target(expected_identity, selected_target(client)) if expected_identity else client.connection_name == backup['connectionName']):
         for entry in reversed(backup['journal']):
             if entry.get('operation') == 'Execute':
                 continue
@@ -1427,8 +1663,28 @@ def recover_plan(client, path, backup, tx):
 
 
 def execute_ai_plan(client, plan):
+    """--write authorizes this validated block; never retry an uncertain write."""
+    if any(item['operation'] != 'Execute' for item in plan) and not client.writable:
+        raise RuntimeError('Modo solo lectura: el bloque contiene escrituras')
+    if getattr(client, 'active_transaction', None):
+        raise RuntimeError('Hay una transaccion anterior pendiente de cierre; no se iniciara otro bloque')
+    if not ensure_connected(client, allow_reconnect=True, allow_restart=True):
+        raise RuntimeError('No se puede iniciar el bloque: ' + str(getattr(client, 'connection_issue', None) or 'conexion no disponible'))
+    previous_scope = getattr(client, '_auto_write_scope', False)
+    previous_block = getattr(client, '_block_active', False)
+    client._auto_write_scope = bool(client.writable)
+    client._block_active = True
+    try:
+        return _execute_ai_plan(client, plan)
+    finally:
+        client._auto_write_scope = previous_scope
+        client._block_active = previous_block
+
+
+def _execute_ai_plan(client, plan):
     """Back up first; use server transaction when available, otherwise compensate."""
-    connection = client.connection_name
+    identity = selected_target(client)
+    mcp_session = getattr(client, 'mcp_session_token', None)
     writes = any(item['operation'] != 'Execute' for item in plan)
     path, backup = create_plan_backup(client, plan) if writes else (None, None)
     tx = None
@@ -1442,6 +1698,7 @@ def execute_ai_plan(client, plan):
             save_recovery_file(path, backup)
             raise RuntimeError('El servidor no devolvio transactionId. No se enviaron cambios del bloque.')
         backup['transactionId'] = tx
+        client.active_transaction = tx
         try:
             save_recovery_file(path, backup)
         except OSError:
@@ -1457,8 +1714,12 @@ def execute_ai_plan(client, plan):
     for index, item in enumerate(plan, 1):
         op, tool, operation = item['instruction'], item['tool'], item['operation']
         try:
-            if client.connection_name != connection or not ensure_connected(client) or client.connection_name != connection:
-                raise RuntimeError('Conexion cambiada o perdida; lote detenido')
+            if not ensure_connected(client, allow_reconnect=not bool(tx), allow_restart=False):
+                raise RuntimeError('No se pudo verificar la conexion antes de enviar la operacion: ' + str(getattr(client, 'connection_issue', None)))
+            if not same_target(identity, selected_target(client)):
+                raise ConnectionIdentityError('La identidad del modelo cambio; operacion no enviada')
+            if tx and getattr(client, 'mcp_session_token', None) != mcp_session:
+                raise ConnectionIdentityError('La sesion MCP cambio durante la transaccion; operacion no enviada')
             fields = dict(item['fields'])
             if operation != 'Execute':
                 ref = object_reference(ai_object(op))
@@ -1495,6 +1756,7 @@ def execute_ai_plan(client, plan):
             final = [(target, target_state(client, target['tool'], target['reference'])) for target in backup['targets']]
             transaction_request(client, 'Commit', tx)
             backup['transactionClosed'] = True
+            client.active_transaction = None
             for target, expected in final:
                 current = target_state(client, target['tool'], target['reference'])
                 check_semantic_state(current)
@@ -1516,12 +1778,14 @@ def execute_ai_plan(client, plan):
             print('ERROR AL CONFIRMAR LA TRANSACCION:', exc)
     if writes:
         backup['results'] = results
+        backup['connectionDiagnostics'] = list(getattr(client, 'connection_events', []))
         backup['status'] = 'fallido' if failed else 'completado'
         if failed:
             recover_plan(client, path, backup, tx)
             client.last_recovery = backup['recovery']
             for row in results:
                 row['recovery'] = backup['recovery']
+            backup['connectionDiagnostics'] = list(getattr(client, 'connection_events', []))
             save_recovery_file(path, backup)
         else:
             save_recovery_file(path, backup)
@@ -1577,15 +1841,13 @@ def ai_block(client):
     for warning in warnings:
         print('AVISO:', warning)
     print('Dependencias del motor:', len(dependencies['rows']) if dependencies['engine'] else 'no disponibles')
-    if input('¿Deseas ver expresiones y propiedades completas? (s/N): ').strip().lower() == 's':
+    if getattr(client, 'debug', False):
         pretty([item['instruction'] for item in plan])
     if any(item['operation'] != 'Execute' for item in plan):
         print('Se creara un respaldo local antes de escribir. Si falla el bloque se intentara restaurar y verificar el estado anterior. No es una copia completa del PBIX/PBIP.')
     if any(item['operation'] == 'Delete' for item in plan):
         print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
-    if input('Escribe CONFIRMAR para ejecutar el bloque completo: ').strip() != 'CONFIRMAR':
-        print('Cancelado')
-        return []
+    print('Ejecutando bloque validado' + ('; escritura autorizada por --write.' if client.writable else '; solo consultas de lectura.'))
     return execute_ai_plan(client, plan)
 
 
@@ -1649,8 +1911,7 @@ def main():
     opts = parser.parse_args()
     if opts.write:
         print('MODO EDICION. Haz copia del PBIX antes de modificarlo.')
-        if input('Escribe EDITAR para continuar: ').strip() != 'EDITAR':
-            return
+        print('--write autoriza las escrituras de los bloques de la opcion 13, sin confirmaciones adicionales.')
     else:
         print('SOLO LECTURA. Para editar: python cliente.py --write')
     client = MCP(opts.write, opts.server, opts.debug)
@@ -1708,7 +1969,7 @@ def main():
             except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
                 print('ERROR:', exc)
                 invalidate_on_error(client, exc)
-            if choice != '0':
+            if choice not in ('0', '13'):
                 input('\nEnter para volver al menu...')
     finally:
         client.close()
