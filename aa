@@ -1,2 +1,1 @@
-nslookup chatgpt.com
-Test-NetConnection chatgpt.com -Port 443
+curl.exe -I -L --max-time 15 https://chatgpt.com
