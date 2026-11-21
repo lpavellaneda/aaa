@@ -1,0 +1,5 @@
+{
+  "action": "delete_measures",
+  "table": "Medidas",
+  "names": ["TEST_MCP_002", "TEST_MCP_001"]
+}
