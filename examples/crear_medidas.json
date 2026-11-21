@@ -1,0 +1,6 @@
+{
+  "operations": [
+    {"action": "create_measure", "table": "Medidas", "name": "TEST_MCP_001", "expression": "1 + 1"},
+    {"action": "create_measure", "table": "Medidas", "name": "TEST_MCP_002", "expression": "[TEST_MCP_001] * 10", "description": "Ejemplo con dependencia"}
+  ]
+}
