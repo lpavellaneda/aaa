@@ -2,6 +2,8 @@ import argparse
 import csv
 import difflib
 import json
+import os
+import uuid
 import time
 import queue
 import re
@@ -901,6 +903,692 @@ def dax_query(client):
             save_csv(rows, name)
 
 
+AI_ACTIONS = {
+    'create_measure': ('measure_operations', 'Create'),
+    'update_measure': ('measure_operations', 'Update'),
+    'delete_measure': ('measure_operations', 'Delete'),
+    'create_column': ('column_operations', 'Create'),
+    'update_column': ('column_operations', 'Update'),
+    'delete_column': ('column_operations', 'Delete'),
+    'execute_dax': ('dax_query_operations', 'Execute'),
+}
+AI_PROPERTIES = {'description', 'displayFolder', 'formatString', 'isHidden', 'dataType'}
+AI_LABELS = {
+    'create_measure': 'Crear medida', 'update_measure': 'Modificar medida',
+    'delete_measure': 'Eliminar medida', 'create_column': 'Crear columna calculada',
+    'update_column': 'Modificar columna calculada', 'delete_column': 'Eliminar columna calculada',
+    'execute_dax': 'Consultar DAX',
+}
+
+
+def parse_ai_block(text):
+    """Strict JSON only. No code evaluation, shell commands or connection overrides."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Clave JSON duplicada: ' + key)
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError('Constante JSON no permitida: ' + value)
+
+    value = json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    if not isinstance(value, dict):
+        raise ValueError('El bloque debe ser un objeto JSON')
+    if 'operations' in value:
+        if set(value) != {'operations'} or not isinstance(value['operations'], list):
+            raise ValueError('Usa un objeto con solo operations y una lista de operaciones')
+        operations = value['operations']
+    else:
+        operations = [value]
+    if not operations:
+        raise ValueError('El bloque no contiene operaciones')
+    expanded = []
+    for index, op in enumerate(operations, 1):
+        if not isinstance(op, dict):
+            raise ValueError(f'Instruccion {index}: se requiere un objeto')
+        if op.get('action') == 'delete_measures':
+            if set(op) != {'action', 'table', 'names'} or not isinstance(op['names'], list) or not op['names']:
+                raise ValueError(f'Instruccion {index}: delete_measures requiere table y names no vacio')
+            expanded.extend({'action': 'delete_measure', 'table': op['table'], 'name': name} for name in op['names'])
+        else:
+            expanded.append(dict(op))
+    for index, op in enumerate(expanded, 1):
+        action = op.get('action')
+        if not isinstance(action, str) or action not in AI_ACTIONS:
+            raise ValueError(f'Operacion {index}: accion no permitida')
+        if action == 'execute_dax':
+            allowed, required = {'action', 'query', 'maxRows'}, {'action', 'query'}
+        else:
+            required = {'action', 'table', 'name'}
+            allowed = required if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
+            if action.startswith('create_'):
+                required = required | {'expression'}
+        if set(op) - allowed or required - set(op):
+            raise ValueError(f'Operacion {index}: campos faltantes o no permitidos: ' +
+                             ', '.join(sorted((set(op) - allowed) | (required - set(op)))))
+        for key in ('table', 'name', 'expression', 'query'):
+            if key in op and (not isinstance(op[key], str) or not op[key].strip()):
+                raise ValueError(f'Operacion {index}: {key} debe ser texto no vacio')
+        for key in AI_PROPERTIES & op.keys():
+            if (key == 'isHidden' and not isinstance(op[key], bool)) or (key != 'isHidden' and not isinstance(op[key], str)):
+                raise ValueError(f'Operacion {index}: tipo incorrecto para {key}')
+        if action.startswith('update_') and not (op.keys() & (AI_PROPERTIES | {'expression'})):
+            raise ValueError(f'Operacion {index}: no hay propiedades para modificar')
+        if 'maxRows' in op and (type(op['maxRows']) is not int or not 1 <= op['maxRows'] <= 100000):
+            raise ValueError(f'Operacion {index}: maxRows debe estar entre 1 y 100000')
+    return expanded
+
+
+def dax_references(expression):
+    """Conservative lexical scan, not a full DAX parser; ignores strings/comments."""
+    pattern = re.compile(r'"(?:[^"]|"")*"|//[^\n]*|--[^\n]*|/\*.*?\*/|'
+                         r"(?:(?:'((?:[^']|'')+)'|([\w]+))\s*)?\[((?:[^\]]|\]\])+?)\]", re.DOTALL)
+    refs = set()
+    for match in pattern.finditer(expression):
+        if match.group(3) is not None:
+            table = match.group(1) or match.group(2)
+            refs.add((table.replace("''", "'").casefold() if table else None,
+                      match.group(3).replace(']]', ']').casefold()))
+    return refs
+
+
+def ai_object(op):
+    return {'tableName': op['table'], 'name': op['name'],
+            **{key: op[key] for key in AI_PROPERTIES | {'expression'} if key in op}}
+
+
+def ai_query_fields(client, op):
+    props = request_schema(client, 'dax_query_operations').get('properties', {})
+    fields = {'query': op['query']}
+    if 'resultMode' in props:
+        fields['resultMode'] = 'Inline'
+    if 'maxRows' in props:
+        fields['maxRows'] = op.get('maxRows', 1000)
+    elif 'maxRows' in op:
+        raise ValueError('El servidor no admite maxRows')
+    return fields
+
+
+def validate_ai_block(client, operations):
+    """Preflight complete ordered plan against a virtual, case-insensitive catalog."""
+    if not client.connection_name:
+        raise ValueError('No hay conexion activa')
+    if not client.writable and any(op['action'] != 'execute_dax' for op in operations):
+        raise ValueError('El bloque contiene escrituras: inicia con --write')
+    tables = {row['name'].casefold(): row['name'] for row in list_objects(client, 'table_operations')}
+    kinds = {AI_ACTIONS[op['action']][0] for op in operations} - {'dax_query_operations'}
+    # Measures are also needed to resolve DAX references in column expressions.
+    if any('expression' in op for op in operations) or any(op['action'].startswith('delete_') for op in operations):
+        kinds.add('measure_operations')
+    inventory = {tool: {} for tool in kinds}
+    for tool in kinds:
+        for row in list_objects(client, tool):
+            if not row.get('tableName'):
+                raise ValueError('No se pudo identificar la tabla de un objeto')
+            inventory[tool][(row['tableName'].casefold(), row['name'].casefold())] = dict(row)
+    plan, warnings, seen, histories, removed = [], [], set(), {}, set()
+    relationships = list_objects(client, 'relationship_operations') if any(op['action'] == 'delete_column' for op in operations) else []
+    measure_tool = 'measure_operations'
+    # Read metadata once per tool, not once per instruction in a large block.
+    if any(op['action'].startswith('delete_') or 'expression' in op for op in operations):
+        for tool in ('measure_operations', 'column_operations'):
+            if tool not in client.tools or not operation_supported(client, tool, 'Get'):
+                warnings.append(f'{tool}: no se pueden leer todas las dependencias en esta version del servidor.')
+                continue
+            if tool not in inventory:
+                inventory[tool] = {(r['tableName'].casefold(), r['name'].casefold()): dict(r)
+                                   for r in list_objects(client, tool)}
+            rows = list(inventory[tool].values())
+            if rows:
+                details = object_rows(request_call(client, tool, 'Get', references=[object_reference(r) for r in rows]),
+                                      'measures' if tool == measure_tool else 'columns')
+                by_name = {}
+                for key in inventory[tool]:
+                    by_name.setdefault(key[1], []).append(key)
+                for detail in details:
+                    keys = [key for key in by_name.get(str(detail.get('name', '')).casefold(), []) if
+                            (not detail.get('tableName') or key[0] == detail['tableName'].casefold())]
+                    if len(keys) == 1:
+                        inventory[tool][keys[0]].update(detail)
+                if any('expression' not in r and tool == measure_tool for r in inventory[tool].values()):
+                    warnings.append('Algunas expresiones existentes no se pudieron leer; el analisis de dependencias es parcial.')
+                if tool == 'column_operations' and any('columnType' not in r for r in inventory[tool].values()):
+                    warnings.append('No se pudieron asociar todos los detalles de columnas; el analisis de dependencias es parcial.')
+    future = {(op['table'].casefold(), op['name'].casefold()): i for i, op in enumerate(operations, 1)
+              if op['action'].startswith('create_')}
+    for index, original in enumerate(operations, 1):
+        op = dict(original)
+        tool, operation = AI_ACTIONS[op['action']]
+        if not operation_supported(client, tool, operation):
+            raise ValueError(f'Operacion {index}: {tool}.{operation} no disponible')
+        fingerprint = json.dumps(op, sort_keys=True, ensure_ascii=False)
+        if fingerprint in seen:
+            raise ValueError(f'Operacion {index}: instruccion duplicada')
+        seen.add(fingerprint)
+        if tool == 'dax_query_operations':
+            for ref_table, ref_name in dax_references(op['query']):
+                if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+                    raise ValueError(f'Operacion {index}: consulta utiliza un objeto eliminado previamente: [{ref_name}]')
+                if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in future) and not any(
+                        k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+                        for rows in inventory.values() for k in rows):
+                    raise ValueError(f'Operacion {index}: consulta utiliza un objeto creado despues: [{ref_name}]')
+            fields = ai_query_fields(client, op)
+        else:
+            key = (op['table'].casefold(), op['name'].casefold())
+            if key[0] not in tables:
+                raise ValueError(f'Operacion {index}: tabla inexistente: {op["table"]}')
+            op['table'] = tables[key[0]]
+            objects = inventory[tool]
+            current = objects.get(key)
+            if operation == 'Create':
+                conflict = current or (tool == measure_tool and any(k[1] == key[1] for k in objects))
+                if conflict:
+                    raise ValueError(f'Operacion {index}: nombre ya existente: {op["name"]}')
+            elif not current:
+                raise ValueError(f'Operacion {index}: objeto inexistente: {op["table"]}[{op["name"]}]')
+            if current:
+                op['name'] = current['name']
+            target = (tool, key)
+            history = histories.setdefault(target, [])
+            if operation in history:
+                raise ValueError(f'Operacion {index}: accion repetida para el mismo objeto')
+            if history and history[-1] == 'Delete':
+                raise ValueError(f'Operacion {index}: recreacion contradictoria tras Delete; divide los bloques')
+            if history:
+                warnings.append(f'Operacion {index}: {operation} actua sobre un objeto utilizado antes en el lote.')
+            if tool == 'column_operations' and current and not history:
+                current.update(get_object(client, tool, current))
+                if not calculated_column(current):
+                    raise ValueError(f'Operacion {index}: columna de origen o tipo no compatible')
+            if operation == 'Delete':
+                if tool == 'column_operations' and any(
+                        (str(r.get(side + 'Table', '')).casefold(), str(r.get(side + 'Column', '')).casefold()) == key
+                        for r in relationships for side in ('from', 'to')):
+                    raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+                for other_tool, rows in inventory.items():
+                    for other_key, other in rows.items():
+                        if other_tool == tool and other_key == key:
+                            continue
+                        refs = dax_references(other.get('expression') or '')
+                        if any(name == key[1] and (table is None or table == key[0]) for table, name in refs):
+                            raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+                del objects[key]
+                removed.add(key)
+            else:
+                for ref_table, ref_name in dax_references(op.get('expression', '')):
+                    if ref_name == key[1] and (ref_table is None or ref_table == key[0]):
+                        raise ValueError(f'Operacion {index}: posible referencia circular al propio objeto')
+                    if any(n == ref_name and (ref_table is None or t == ref_table) for t, n in removed):
+                        raise ValueError(f'Operacion {index}: referencia a objeto eliminado previamente: [{ref_name}]')
+                    candidates = [(t, n) for t, n in future if n == ref_name and (ref_table is None or t == ref_table)]
+                    known = any(k[1] == ref_name and (ref_table is None or k[0] == ref_table)
+                                for rows in inventory.values() for k in rows)
+                    if candidates and not known:
+                        raise ValueError(f'Operacion {index}: referencia a objeto creado despues o a si mismo: [{ref_name}]')
+                    if known:
+                        warnings.append(f'Operacion {index}: posible dependencia DAX de [{ref_name}]; se conserva el orden indicado.')
+                objects[key] = dict(current or {}, **ai_object(op))
+                if tool == 'column_operations' and operation == 'Create':
+                    objects[key]['columnType'] = 'Calculated'
+            history.append(operation)
+            fields = build_object_fields(client, tool, operation, ai_object(op))
+        root = tool_schema(client, tool)
+        req = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
+        unknown = set(fields) - request_schema(client, tool).get('properties', {}).keys()
+        if unknown:
+            raise ValueError(f'Operacion {index}: campos no admitidos por el servidor: {sorted(unknown)}')
+        validate_schema(root, root, req, f'Operacion {index}')
+        plan.append({'instruction': op, 'tool': tool, 'operation': operation, 'fields': fields})
+    # Detect indirect cycles among the measure definitions available to preflight.
+    measures = inventory.get(measure_tool, {})
+    names = {}
+    for key in measures:
+        names.setdefault(key[1], set()).add(key)
+    graph = {}
+    for key, obj in measures.items():
+        refs = dax_references(obj.get('expression') or '')
+        graph[key] = {other for table, name in refs for other in names.get(name, ())
+                      if table is None or table == other[0]}
+    touched = {(item['instruction']['table'].casefold(), item['instruction']['name'].casefold())
+               for item in plan if item['tool'] == measure_tool and item['operation'] != 'Delete'}
+    # Iterative traversal avoids Python recursion limits for long dependency chains.
+    done = set()
+    for start in touched & graph.keys():
+        stack, active = [(start, False)], set()
+        while stack:
+            node, leaving = stack.pop()
+            if leaving:
+                active.discard(node)
+                done.add(node)
+            elif node in active:
+                raise ValueError('Posible dependencia circular entre medidas; revisa las expresiones del bloque')
+            elif node not in done:
+                active.add(node)
+                stack.append((node, True))
+                stack.extend((child, False) for child in graph.get(node, ()))
+    return plan, list(dict.fromkeys(warnings))
+
+
+RECOVERY_VOLATILE = {'modifiedTime', 'structureModifiedTime', 'state', 'errorMessage'}
+
+
+def dependency_report(client):
+    """Read engine dependencies when supported, explicitly disclose missing scope."""
+    report = {'engine': False, 'complete': False, 'rows': [], 'warnings': [
+        'No se verifican todos los usos en visuales, filtros, marcadores ni otros objetos del informe; el MCP consulta el modelo semantico, no el informe completo.']}
+    try:
+        fields = ai_query_fields(client, {'query': 'EVALUATE INFO.CALCDEPENDENCY()', 'maxRows': 100000})
+        rows = dax_rows(request_call(client, 'dax_query_operations', 'Execute', **fields))
+        required = {'[OBJECT]', '[REFERENCED_OBJECT]', '[OBJECT_TYPE]', '[REFERENCED_OBJECT_TYPE]'}
+        if rows and not required <= rows[0].keys():
+            raise RuntimeError('El motor devuelve otro formato de dependencias')
+        report.update(engine=True, complete=len(rows) < 100000, rows=rows)
+        if not report['complete']:
+            report['warnings'].append('La respuesta de dependencias alcanzo el limite; el resultado es parcial.')
+    except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+        report['warnings'].append('No fue posible verificar dependencias con el motor: ' + str(exc) + '. Se usa el analisis DAX local, que es aproximado.')
+        if not client.connection_name:
+            raise RuntimeError('Conexion perdida durante la consulta de dependencias') from exc
+    return report
+
+
+def check_engine_dependencies(plan, report):
+    if not report['engine']:
+        return
+    changes = {}
+    deletes = {}
+    for i, item in enumerate(plan):
+        op = item['instruction']
+        if item['tool'] not in ('measure_operations', 'column_operations'):
+            continue
+        key = (item['tool'], op['table'].casefold(), op['name'].casefold())
+        changes.setdefault(key, []).append((i, item))
+        if item['operation'] == 'Delete':
+            deletes[key] = i
+    for row in report['rows']:
+        target_type = str(row.get('[REFERENCED_OBJECT_TYPE]', '')).upper()
+        target_tool = 'measure_operations' if target_type == 'MEASURE' else 'column_operations'
+        key = (target_tool, str(row.get('[REFERENCED_TABLE]', '')).casefold(), str(row.get('[REFERENCED_OBJECT]', '')).casefold())
+        if key not in deletes:
+            continue
+        source_type = str(row.get('[OBJECT_TYPE]', '')).upper()
+        source_tool = 'measure_operations' if source_type == 'MEASURE' else 'column_operations'
+        source = (source_tool, str(row.get('[TABLE]', '')).casefold(), str(row.get('[OBJECT]', '')).casefold())
+        if source == key:
+            continue
+        resolved = False
+        for index, change in changes.get(source, []):
+            if index >= deletes[key]:
+                break
+            if change['operation'] == 'Delete':
+                resolved = True
+            elif 'expression' in change['instruction']:
+                refs = dax_references(change['instruction']['expression'])
+                resolved = not any(name == key[2] and (table is None or table == key[1]) for table, name in refs)
+        if not resolved:
+            raise ValueError('Dependencia detectada por el motor: ' + str(row.get('[TABLE]', '?')) +
+                             '[' + str(row.get('[OBJECT]', '?')) + '] utiliza el objeto que se intenta eliminar. Modifica o elimina primero el dependiente.')
+
+
+def target_state(client, tool, reference):
+    matches = [row for row in list_objects(client, tool) if row.get('name') == reference['name'] and
+               row.get('tableName') == reference['tableName']]
+    return get_object(client, tool, reference) if matches else None
+
+
+def stable_state(value):
+    if isinstance(value, dict):
+        value = dict(value)
+        if 'name' in value and 'tableName' in value:
+            for key in ('description', 'displayFolder', 'formatString'):
+                value[key] = value.get(key) or ''
+            for key in ('annotations', 'extendedProperties'):
+                value[key] = value.get(key) or []
+        return {key: stable_state(item) for key, item in value.items() if key not in RECOVERY_VOLATILE}
+    if isinstance(value, list):
+        return [stable_state(item) for item in value]
+    return value
+
+
+def check_semantic_state(state):
+    if state is None:
+        return
+    error = state.get('errorMessage')
+    status = str(state.get('state', '')).casefold()
+    if (isinstance(error, str) and error.strip()) or 'error' in status:
+        raise RuntimeError('El motor marco el objeto con error semantico: ' +
+                           str(error or state.get('state')))
+
+
+def save_recovery_file(path, data):
+    """Persist before writing the model. Atomic replacement prevents half a journal."""
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w', encoding='utf-8', newline='\n') as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def create_plan_backup(client, plan):
+    folder = Path(getattr(client, 'backup_dir', Path.cwd() / 'backups'))
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / ('bloque_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex + '.json')
+    data = {'format': 1, 'model': client.model_name, 'connectionName': client.connection_name,
+            'instance': {key: (client.instance or {}).get(key) for key in ('port', 'processId', 'startTime', 'parentWindowTitle')},
+            'status': 'preparado', 'recovery': 'no_necesaria', 'targets': [], 'journal': [],
+            'plan': [item['instruction'] for item in plan],
+            'scope': 'Estado de objetos del modelo; no es una copia completa del PBIX/PBIP ni del informe.'}
+    seen = set()
+    for item in plan:
+        if item['operation'] == 'Execute':
+            continue
+        ref = object_reference(ai_object(item['instruction']))
+        key = (item['tool'], ref['tableName'], ref['name'])
+        if key in seen:
+            continue
+        seen.add(key)
+        before = target_state(client, item['tool'], ref)
+        target = {'tool': item['tool'], 'reference': ref, 'before': before}
+        if before and operation_supported(client, item['tool'], 'ExportTMDL'):
+            try:
+                target['tmdlExport'] = request_call(client, item['tool'], 'ExportTMDL', references=[ref],
+                                                  tmdlExportOptions={'maxReturnCharacters': -1})
+            except (RuntimeError, ValueError) as exc:
+                target['tmdlExportError'] = str(exc)
+                print('AVISO: respaldo JSON disponible; no se pudo exportar TMDL:', exc)
+        data['targets'].append(target)
+    save_recovery_file(path, data)
+    print('Respaldo local:', path.resolve())
+    client.last_backup_path = str(path.resolve())
+    return path, data
+
+
+def transaction_request(client, operation, transaction_id=None):
+    req = {'operation': operation}
+    if operation == 'Begin':
+        req['connectionName'] = client.connection_name
+    else:
+        req['transactionId'] = transaction_id
+    root = tool_schema(client, 'transaction_operations')
+    validate_schema(root, root, {'request': req})
+    return unwrap_result(client.tool('transaction_operations', {'request': req}))
+
+
+def transaction_id(value):
+    if isinstance(value, dict):
+        if isinstance(value.get('transactionId'), str):
+            return value['transactionId']
+        for child in value.values():
+            found = transaction_id(child)
+            if found:
+                return found
+    return None
+
+
+def restore_definition(client, tool, state):
+    props = definition_properties(client, tool)
+    result = {key: value for key, value in state.items() if key in props and key not in RECOVERY_VOLATILE}
+    if tool == 'measure_operations':
+        result.pop('dataType', None)  # Inferred by the expression, not freely writable.
+    for key in ('description', 'displayFolder', 'formatString'):
+        if key in props:
+            result[key] = state.get(key) or ''
+    for key in ('annotations', 'extendedProperties'):
+        if key in props:
+            result[key] = state.get(key) or []
+    return result
+
+
+def verify_backup(client, backup):
+    differences = []
+    for target in backup['targets']:
+        try:
+            current = target_state(client, target['tool'], target['reference'])
+            if stable_state(current) != stable_state(target['before']):
+                differences.append(target['reference']['tableName'] + '[' + target['reference']['name'] + ']: estado distinto')
+            elif current and target['before']:
+                before_error = target['before'].get('errorMessage') or 'error' in str(target['before'].get('state', '')).casefold()
+                if not before_error:
+                    check_semantic_state(current)
+        except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+            differences.append(target['reference']['name'] + ': no se pudo verificar: ' + str(exc))
+    return differences
+
+
+def recover_plan(client, path, backup, tx):
+    print('\nRECUPERACION: intentando restaurar el estado anterior...')
+    recovery_errors = []
+    if tx:
+        if not backup.get('transactionClosed'):
+            try:
+                transaction_request(client, 'Rollback', tx)
+                backup['transactionClosed'] = True
+            except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+                recovery_errors.append('Rollback del servidor: ' + str(exc))
+        # Reuse the same known connection only if the original process and model
+        # are still available; never attach recovery to another Desktop instance.
+        if not client.connection_name and getattr(client, 'process', None) is not None and client.process.poll() is None:
+            client.connection_name = backup['connectionName']
+            client.model_name = backup['model']
+            client.instance = backup['instance']
+            ensure_connected(client)
+        differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; no se pudo verificar el modelo']
+        if not differences and backup.get('transactionClosed'):
+            backup['recovery'] = 'verificada'
+            backup['recoveryErrors'] = recovery_errors
+            save_recovery_file(path, backup)
+            print('RECUPERACION VERIFICADA: los objetos afectados coinciden con el respaldo previo.')
+            return True
+        # Never issue compensating writes while a server transaction may still be open.
+        if not backup.get('transactionClosed'):
+            backup['recovery'] = 'incompleta'
+            backup['recoveryErrors'] = recovery_errors + differences
+            save_recovery_file(path, backup)
+            print('RECUPERACION NO VERIFICADA. Conserva el respaldo:', path)
+            return False
+    if client.connection_name == backup['connectionName'] and ensure_connected(client):
+        for entry in reversed(backup['journal']):
+            if entry.get('operation') == 'Execute':
+                continue
+            tool, ref, before = entry['tool'], entry['reference'], entry['before']
+            try:
+                current = target_state(client, tool, ref)
+                if stable_state(current) == stable_state(before):
+                    continue
+                if before is None:
+                    fields = build_object_fields(client, tool, 'Delete', ref)
+                    request_call(client, tool, 'Delete', **fields)
+                else:
+                    operation = 'Update' if current else 'Create'
+                    definition = restore_definition(client, tool, before)
+                    fields = build_object_fields(client, tool, operation, definition)
+                    request_call(client, tool, operation, **fields)
+            except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+                recovery_errors.append(ref['name'] + ': ' + str(exc))
+    else:
+        recovery_errors.append('No se puede restaurar con certeza la conexion original')
+    differences = verify_backup(client, backup) if client.connection_name else ['Conexion perdida; verificacion pendiente']
+    backup['recovery'] = 'verificada' if not differences else 'incompleta'
+    backup['recoveryErrors'] = recovery_errors + differences
+    save_recovery_file(path, backup)
+    if not differences:
+        print('RECUPERACION VERIFICADA para los objetos respaldados; no implica restauracion del informe completo.')
+        return True
+    print('RECUPERACION INCOMPLETA. Diferencias o errores:')
+    for message in recovery_errors + differences:
+        print('-', message)
+    print('Respaldo para revision:', path)
+    return False
+
+
+def execute_ai_plan(client, plan):
+    """Back up first; use server transaction when available, otherwise compensate."""
+    connection = client.connection_name
+    writes = any(item['operation'] != 'Execute' for item in plan)
+    path, backup = create_plan_backup(client, plan) if writes else (None, None)
+    tx = None
+    client.last_recovery = 'no_necesaria'
+    has_queries = any(item['operation'] == 'Execute' for item in plan)
+    if writes and not has_queries and 'transaction_operations' in client.tools and all(
+            operation_supported(client, 'transaction_operations', op) for op in ('Begin', 'Commit', 'Rollback')):
+        tx = transaction_id(transaction_request(client, 'Begin'))
+        if not tx:
+            backup['status'] = 'inicio_transaccion_no_confirmado'
+            save_recovery_file(path, backup)
+            raise RuntimeError('El servidor no devolvio transactionId. No se enviaron cambios del bloque.')
+        backup['transactionId'] = tx
+        try:
+            save_recovery_file(path, backup)
+        except OSError:
+            transaction_request(client, 'Rollback', tx)
+            raise
+        print('Proteccion: transaccion del servidor; la recuperacion se verificara por lectura.')
+    elif writes:
+        print('Proteccion: respaldo y compensacion de cambios; este bloque no usa transaccion global.')
+        if has_queries:
+            print('El bloque contiene consultas DAX: se usa compensacion para que vean los cambios ya aplicados; el servidor DAX utiliza otra sesion.')
+    results = []
+    failed = False
+    for index, item in enumerate(plan, 1):
+        op, tool, operation = item['instruction'], item['tool'], item['operation']
+        try:
+            if client.connection_name != connection or not ensure_connected(client) or client.connection_name != connection:
+                raise RuntimeError('Conexion cambiada o perdida; lote detenido')
+            fields = dict(item['fields'])
+            if operation != 'Execute':
+                ref = object_reference(ai_object(op))
+                backup['journal'].append({'index': index, 'tool': tool, 'operation': operation, 'reference': ref,
+                                          'before': target_state(client, tool, ref), 'status': 'enviando'})
+                backup['status'] = 'ejecutando'
+                save_recovery_file(path, backup)
+                if tx and 'options' in fields:
+                    fields['options'] = dict(fields['options'], useTransaction=False)
+            value = request_call(client, tool, operation, **fields)
+            if tool == 'dax_query_operations':
+                rows = dax_rows(value)
+                display_grid(rows)
+                if len(rows) >= item['fields'].get('maxRows', 1000):
+                    print('Se alcanzo el limite de filas; el resultado puede estar truncado.')
+            elif not verify_write(client, tool, operation, ai_object(op)):
+                raise RuntimeError('Resultado no confirmado por lectura; revisa el modelo antes de reintentar')
+            if operation != 'Execute' and not tx and operation != 'Delete':
+                check_semantic_state(target_state(client, tool, object_reference(ai_object(op))))
+            if operation != 'Execute':
+                backup['journal'][-1]['status'] = 'verificada'
+                save_recovery_file(path, backup)
+            label = 'Verificada, pendiente de Commit' if tx else 'Correcta'
+            print(f'[{index}/{len(plan)}] {label}: {AI_LABELS[op["action"]]} ' + op.get('name', 'consulta'))
+            results.append({'index': index, 'action': op['action'], 'status': 'correcta'})
+        except (ValueError, RuntimeError, TimeoutError, OSError, KeyError, TypeError, KeyboardInterrupt) as exc:
+            invalidate_on_error(client, exc)
+            print(f'[{index}/{len(plan)}] ERROR: {exc}')
+            results.append({'index': index, 'action': op['action'], 'status': 'fallida', 'error': str(exc)})
+            failed = True
+            break
+    if not failed and tx:
+        try:
+            final = [(target, target_state(client, target['tool'], target['reference'])) for target in backup['targets']]
+            transaction_request(client, 'Commit', tx)
+            backup['transactionClosed'] = True
+            for target, expected in final:
+                current = target_state(client, target['tool'], target['reference'])
+                check_semantic_state(current)
+                # SaveChanges/Commit resolves inferred types. Compare requested types
+                # exactly, but do not mistake normal inference for a failed commit.
+                explicit_type = any(item['tool'] == target['tool'] and
+                                    item['instruction'].get('name') == target['reference']['name'] and
+                                    item['instruction'].get('table') == target['reference']['tableName'] and
+                                    'dataType' in item['instruction'] for item in plan)
+                if current is not None and expected is not None and not explicit_type:
+                    current, expected = dict(current), dict(expected)
+                    current.pop('dataType', None)
+                    expected.pop('dataType', None)
+                if stable_state(current) != stable_state(expected):
+                    raise RuntimeError('El estado despues de Commit no coincide con el esperado')
+        except (ValueError, RuntimeError, TimeoutError, OSError, KeyboardInterrupt) as exc:
+            failed = True
+            backup['commitError'] = str(exc)
+            print('ERROR AL CONFIRMAR LA TRANSACCION:', exc)
+    if writes:
+        backup['results'] = results
+        backup['status'] = 'fallido' if failed else 'completado'
+        if failed:
+            recover_plan(client, path, backup, tx)
+            client.last_recovery = backup['recovery']
+            for row in results:
+                row['recovery'] = backup['recovery']
+            save_recovery_file(path, backup)
+        else:
+            save_recovery_file(path, backup)
+    client.last_block_status = 'fallido' if failed else 'completado'
+    skipped = len(plan) - len(results)
+    print('\nRESULTADO FINAL')
+    print('Verificadas antes de recuperacion:' if writes and failed else 'Correctas:',
+          sum(r['status'] == 'correcta' for r in results))
+    print('Fallidas:', sum(r['status'] == 'fallida' for r in results) + int(bool(backup and backup.get('commitError'))))
+    print('No ejecutadas:', skipped)
+    print('Estado final del bloque:', client.last_block_status)
+    if writes and failed:
+        print('Estado de recuperacion:', client.last_recovery, '(los exitos anteriores no equivalen a cambios conservados)')
+        if client.last_recovery == 'verificada':
+            print('Cambios del bloque conservados: 0; se restauro el estado anterior de los objetos respaldados.')
+        if backup.get('commitError'):
+            print('Fallo final de Commit:', backup['commitError'])
+    for row in results:
+        if row.get('error'):
+            print(f'Detalle del error [{row["index"]}]: {row["error"]}')
+    return results
+
+
+def ai_block(client):
+    if not ensure_connected(client):
+        return []
+    print('Pega el bloque JSON generado por IA. Escribe FIN en una linea independiente para terminar:')
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == 'FIN':
+            break
+        lines.append(line)
+    operations = parse_ai_block('\n'.join(lines))
+    print('Validando instrucciones...')
+    plan, warnings = validate_ai_block(client, operations)
+    dependencies = dependency_report(client)
+    check_engine_dependencies(plan, dependencies)
+    warnings.extend(dependencies['warnings'])
+    print('\nModelo de destino:', client.model_name)
+    counts = {}
+    for item in plan:
+        action = item['instruction']['action']
+        counts[action] = counts.get(action, 0) + 1
+    print('Operaciones detectadas:')
+    for action, count in counts.items():
+        print(f'- {AI_LABELS[action]}: {count}')
+    print('Total:', len(plan), 'operaciones')
+    print('Vista previa completa en orden:')
+    for i, item in enumerate(plan, 1):
+        op = item['instruction']
+        print(f'{i}. {AI_LABELS[op["action"]]} ' + (f'{op["table"]}[{op["name"]}]' if 'name' in op else 'consulta DAX'))
+    for warning in warnings:
+        print('AVISO:', warning)
+    print('Dependencias del motor:', len(dependencies['rows']) if dependencies['engine'] else 'no disponibles')
+    if input('¿Deseas ver expresiones y propiedades completas? (s/N): ').strip().lower() == 's':
+        pretty([item['instruction'] for item in plan])
+    if any(item['operation'] != 'Execute' for item in plan):
+        print('Se creara un respaldo local antes de escribir. Si falla el bloque se intentara restaurar y verificar el estado anterior. No es una copia completa del PBIX/PBIP.')
+    if any(item['operation'] == 'Delete' for item in plan):
+        print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
+    if input('Escribe CONFIRMAR para ejecutar el bloque completo: ').strip() != 'CONFIRMAR':
+        print('Cancelado')
+        return []
+    return execute_ai_plan(client, plan)
+
+
 def advanced(client):
     print('\nHerramientas disponibles:')
     for name in client.tools:
@@ -957,6 +1645,7 @@ def main():
     parser.add_argument('--write', action='store_true', help='Habilitar edicion')
     parser.add_argument('--debug', action='store_true', help='Mostrar respuestas MCP completas')
     parser.add_argument('--server', type=Path, help='Ejecutable autorizado (opcional)')
+    parser.add_argument('--backup-dir', type=Path, default=Path.cwd() / 'backups', help='Carpeta local de respaldos de bloques')
     opts = parser.parse_args()
     if opts.write:
         print('MODO EDICION. Haz copia del PBIX antes de modificarlo.')
@@ -965,6 +1654,7 @@ def main():
     else:
         print('SOLO LECTURA. Para editar: python cliente.py --write')
     client = MCP(opts.write, opts.server, opts.debug)
+    client.backup_dir = opts.backup_dir
     try:
         try:
             connect(client)
@@ -987,6 +1677,7 @@ def main():
             print('10. Consultar relaciones')
             print('11. Ejecutar consulta DAX')
             print('12. Herramienta avanzada')
+            print('13. Ejecutar bloque de instrucciones de IA')
             print('0. Salir')
             choice = input('Opcion: ').strip()
             if choice == '0':
@@ -1010,6 +1701,8 @@ def main():
                     dax_query(client)
                 elif choice == '12':
                     advanced(client)
+                elif choice == '13':
+                    ai_block(client)
                 else:
                     print('Opcion invalida')
             except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
@@ -1028,3 +1721,4 @@ if __name__ == '__main__':
     except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
         print('ERROR:', exc)
         sys.exit(1)
+
