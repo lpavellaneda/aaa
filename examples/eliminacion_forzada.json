@@ -1,0 +1,6 @@
+{
+  "operations": [
+    {"action": "delete_measure", "table": "TU_TABLA", "name": "TU_MEDIDA", "force": true},
+    {"action": "delete_column", "table": "TU_TABLA", "name": "TU_COLUMNA_CALCULADA", "force": true}
+  ]
+}
