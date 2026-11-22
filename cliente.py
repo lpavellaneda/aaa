@@ -685,7 +685,7 @@ def object_reference(obj, table=False):
 
 
 def get_object(client, tool, obj):
-    rows = object_rows(request_call(client, tool, 'Get', references=[object_reference(obj, tool == 'table_operations')]), tool.split('_')[0] + 's')
+    rows = object_rows(request_call(client, tool, 'Get', references=[object_reference(obj, tool in ('table_operations', 'relationship_operations'))]), tool.split('_')[0] + 's')
     if len(rows) != 1:
         raise RuntimeError('No se pudo identificar un unico objeto')
     return dict(obj, **rows[0])
@@ -720,6 +720,57 @@ def display_grid(rows):
     print('Filas:', len(rows), '(celdas en pantalla limitadas a 60 caracteres; CSV conserva el valor)')
 
 
+def metadata_export(client, section='all'):
+    """Keep every property returned by Get, including formatting and annotations."""
+    result = {'schemaVersion': 1, 'model': client.model_name, 'complete': True,
+              'warnings': ['Metadatos del modelo; no incluye datos de filas ni todos los usos en visuales/filtros del informe.'],
+              'errors': []}
+    mapping = {'tables': 'table_operations', 'measures': 'measure_operations',
+               'columns': 'column_operations', 'relationships': 'relationship_operations'}
+    sections = mapping if section == 'all' else {section: mapping[section]}
+    for label, tool in sections.items():
+        result[label] = []
+        try:
+            rows = list_objects(client, tool)
+            if len(rows) >= 100000:
+                raise RuntimeError('Inventario posiblemente truncado')
+            for row in rows:
+                try:
+                    if tool == 'relationship_operations':
+                        details = object_rows(request_call(client, tool, 'Get', references=[{'name': row['name']}]), 'relationships')
+                        if len(details) != 1:
+                            raise RuntimeError('No se pudo leer una relacion unica')
+                        detail = dict(row, **details[0])
+                    else:
+                        detail = get_object(client, tool, row)
+                    result[label].append(detail)
+                except (RuntimeError, ValueError, TimeoutError, OSError, KeyError) as exc:
+                    result[label].append(dict(row, metadataIncomplete=True))
+                    result['errors'].append(f'{label}: {row.get("name")}: {exc}')
+        except (RuntimeError, ValueError, TimeoutError, OSError, KeyError) as exc:
+            result['errors'].append(f'{label}: {exc}')
+    if 'columns' in result:
+        result['calculatedColumns'] = [dict(col) for col in result['columns'] if calculated_column(col)]
+    result['complete'] = not result['errors']
+    return result
+
+
+def print_metadata_export(client, section='all'):
+    data = metadata_export(client, section)
+    folder = Path(getattr(client, 'export_dir', Path.cwd() / 'exports'))
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / ('metadatos_' + section + '_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8] + '.json')
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    path.write_text(text, encoding='utf-8')
+    print('\n========== JSON DE METADATOS ==========')
+    print(text)
+    print('========== FIN JSON ==========')
+    print('Archivo UTF-8:', path.resolve())
+    if not data['complete']:
+        print('AVISO: exportacion parcial; consulta errors antes de usarla.')
+    return data
+
+
 def simple_list(client, tool, title):
     if not ensure_connected(client):
         return
@@ -736,33 +787,28 @@ def simple_list(client, tool, title):
     show_objects(rows)
     if not rows:
         return
-    if tool == 'measure_operations':
-        while True:
-            raw = input('Numero para ver DAX, /texto para filtrar nombre/tabla, Enter para regresar: ').strip()
-            if not raw:
-                return
-            if raw.startswith('/'):
-                text = raw[1:].casefold()
-                filtered = [r for r in rows if text in (r.get('name', '') + ' ' + r.get('tableName', '')).casefold()]
-                show_objects(filtered)
-                if filtered:
-                    obj = choose(filtered, 'Selecciona medida (Enter=regresar): ')
-                else:
-                    continue
-            else:
-                if not raw.isdigit() or not 1 <= int(raw) <= len(rows):
-                    print('Seleccion invalida')
-                    continue
-                obj = rows[int(raw) - 1]
-            if obj:
-                show_details(get_object(client, tool, obj))
-    elif operation_supported(client, tool, 'Get'):
-        obj = choose(rows, 'Tabla para ver estructura (Enter=regresar): ')
+    while True:
+        section = 'measures' if tool == 'measure_operations' else 'all'
+        raw = input('Numero para ver detalle, json=exportar JSON completo, /texto para filtrar, Enter para regresar: ').strip()
+        if not raw:
+            return
+        if raw.casefold() == 'json':
+            print_metadata_export(client, section)
+            continue
+        if raw.startswith('/'):
+            text = raw[1:].casefold()
+            filtered = [r for r in rows if text in (r.get('name', '') + ' ' + r.get('tableName', '')).casefold()]
+            show_objects(filtered)
+            obj = choose(filtered, 'Selecciona objeto (Enter=regresar): ') if filtered else None
+        elif raw.isdigit() and 1 <= int(raw) <= len(rows):
+            obj = rows[int(raw) - 1]
+        else:
+            print('Seleccion invalida')
+            continue
         if obj:
             show_details(get_object(client, tool, obj))
-            if 'column_operations' in client.tools:
-                columns = [r for r in list_objects(client, 'column_operations') if r.get('tableName') == obj['name']]
-                display_grid(columns)
+            if tool == 'table_operations' and 'column_operations' in client.tools:
+                display_grid([r for r in list_objects(client, 'column_operations') if r.get('tableName') == obj['name']])
 
 
 def show_details(obj):
@@ -1154,9 +1200,10 @@ def parse_ai_block(text):
         if not isinstance(op, dict):
             raise ValueError(f'Instruccion {index}: se requiere un objeto')
         if op.get('action') == 'delete_measures':
-            if set(op) != {'action', 'table', 'names'} or not isinstance(op['names'], list) or not op['names']:
+            if set(op) - {'action', 'table', 'names', 'force'} or not {'action', 'table', 'names'} <= op.keys() or not isinstance(op['names'], list) or not op['names']:
                 raise ValueError(f'Instruccion {index}: delete_measures requiere table y names no vacio')
-            expanded.extend({'action': 'delete_measure', 'table': op['table'], 'name': name} for name in op['names'])
+            expanded.extend(dict(action='delete_measure', table=op['table'], name=name,
+                                 **({'force': op['force']} if 'force' in op else {})) for name in op['names'])
         else:
             expanded.append(dict(op))
     for index, op in enumerate(expanded, 1):
@@ -1167,7 +1214,7 @@ def parse_ai_block(text):
             allowed, required = {'action', 'query', 'maxRows'}, {'action', 'query'}
         else:
             required = {'action', 'table', 'name'}
-            allowed = required if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
+            allowed = required | {'force'} if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
             if action.startswith('create_'):
                 required = required | {'expression'}
         if set(op) - allowed or required - set(op):
@@ -1183,6 +1230,8 @@ def parse_ai_block(text):
             raise ValueError(f'Operacion {index}: no hay propiedades para modificar')
         if 'maxRows' in op and (type(op['maxRows']) is not int or not 1 <= op['maxRows'] <= 100000):
             raise ValueError(f'Operacion {index}: maxRows debe estar entre 1 y 100000')
+        if 'force' in op and type(op['force']) is not bool:
+            raise ValueError(f'Operacion {index}: force debe ser true o false')
     return expanded
 
 
@@ -1315,17 +1364,22 @@ def validate_ai_block(client, operations):
                 if not calculated_column(current):
                     raise ValueError(f'Operacion {index}: columna de origen o tipo no compatible')
             if operation == 'Delete':
+                forced = op.get('force', False)
                 if tool == 'column_operations' and any(
                         (str(r.get(side + 'Table', '')).casefold(), str(r.get(side + 'Column', '')).casefold()) == key
                         for r in relationships for side in ('from', 'to')):
-                    raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+                    if not forced:
+                        raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+                    warnings.append(f'Operacion {index}: FORZADA; la columna participa en una relacion y la cascada puede eliminarla.')
                 for other_tool, rows in inventory.items():
                     for other_key, other in rows.items():
                         if other_tool == tool and other_key == key:
                             continue
                         refs = dax_references(other.get('expression') or '')
                         if any(name == key[1] and (table is None or table == key[0]) for table, name in refs):
-                            raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+                            if not forced:
+                                raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+                            warnings.append(f'Operacion {index}: FORZADA; puede afectar {other.get("tableName", "?")}[{other["name"]}].')
                 del objects[key]
                 removed.add(key)
             else:
@@ -1346,6 +1400,8 @@ def validate_ai_block(client, operations):
                     objects[key]['columnType'] = 'Calculated'
             history.append(operation)
             fields = build_object_fields(client, tool, operation, ai_object(op))
+            if operation == 'Delete' and op.get('force'):
+                fields['shouldCascadeDelete'] = True
         root = tool_schema(client, tool)
         req = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
         unknown = set(fields) - request_schema(client, tool).get('properties', {}).keys()
@@ -1440,6 +1496,10 @@ def check_engine_dependencies(plan, report):
                 refs = dax_references(change['instruction']['expression'])
                 resolved = not any(name == key[2] and (table is None or table == key[1]) for table, name in refs)
         if not resolved:
+            if plan[deletes[key]]['instruction'].get('force'):
+                report['warnings'].append('FORZADA: dependencia del motor: ' + str(row.get('[TABLE]', '?')) +
+                                          '[' + str(row.get('[OBJECT]', '?')) + ']. Puede eliminarse o quedar invalida.')
+                continue
             raise ValueError('Dependencia detectada por el motor: ' + str(row.get('[TABLE]', '?')) +
                              '[' + str(row.get('[OBJECT]', '?')) + '] utiliza el objeto que se intenta eliminar. Modifica o elimina primero el dependiente.')
 
@@ -1496,6 +1556,14 @@ def create_plan_backup(client, plan):
             'plan': [item['instruction'] for item in plan],
             'scope': 'Estado de objetos del modelo; no es una copia completa del PBIX/PBIP ni del informe.'}
     seen = set()
+    if any(item['instruction'].get('force') for item in plan):
+        data['forceSnapshot'] = metadata_export(client)
+        if not data['forceSnapshot']['complete']:
+            raise RuntimeError('No se puede respaldar todo el alcance de la cascada: ' + '; '.join(data['forceSnapshot']['errors']))
+        # TMDL also retains objects outside the basic tables/columns/measures scope.
+        data['forceTmdl'] = request_call(client, 'model_operations', 'ExportTMDL',
+                                       tmdlExportOptions={'serializationOptions': {'includeChildren': True},
+                                                          'maxReturnCharacters': -1})
     for item in plan:
         if item['operation'] == 'Execute':
             continue
@@ -1571,6 +1639,32 @@ def verify_backup(client, backup):
                         verify_column_storage(client, target['reference'])
         except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
             differences.append(target['reference']['name'] + ': no se pudo verificar: ' + str(exc))
+    if backup.get('forceSnapshot'):
+        current = metadata_export(client)
+        differences.extend(snapshot_differences(backup['forceSnapshot'], current))
+        try:
+            tmdl = request_call(client, 'model_operations', 'ExportTMDL',
+                               tmdlExportOptions={'serializationOptions': {'includeChildren': True},
+                                                  'maxReturnCharacters': -1})
+            if tmdl != backup.get('forceTmdl'):
+                differences.append('El TMDL del modelo difiere del respaldo anterior a la cascada')
+        except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+            differences.append('No se pudo verificar el TMDL despues de la cascada: ' + str(exc))
+    return differences
+
+
+def snapshot_differences(before, after):
+    differences = list(after.get('errors', []))
+    for section in ('tables', 'measures', 'columns', 'relationships'):
+        def indexed(snapshot):
+            return {(r.get('tableName', ''), r['name']):
+                    {'metadata': stable_state(r), 'errorMessage': r.get('errorMessage') or '',
+                     'semanticError': 'error' in str(r.get('state', '')).casefold()}
+                    for r in snapshot.get(section, [])}
+        previous, current = indexed(before), indexed(after)
+        for key in previous.keys() | current.keys():
+            if previous.get(key) != current.get(key):
+                differences.append(f'{section}: {key[0]}[{key[1]}]: metadatos distintos')
     return differences
 
 
@@ -1682,6 +1776,16 @@ def execute_ai_plan(client, plan):
     """--write authorizes this validated block; never retry an uncertain write."""
     if any(item['operation'] != 'Execute' for item in plan) and not client.writable:
         raise RuntimeError('Modo solo lectura: el bloque contiene escrituras')
+    forced = [item for item in plan if item['instruction'].get('force')]
+    if forced:
+        if not all(item.get('forceAuthorized') is True for item in forced):
+            raise RuntimeError('Eliminacion forzada sin CONFIRMAR FORZAR; no se enviaron cambios')
+        if any(item['operation'] == 'Execute' for item in plan):
+            raise ValueError('Separa las consultas execute_dax del bloque forzado para conservar la transaccion global')
+        if 'transaction_operations' not in client.tools or not all(operation_supported(client, 'transaction_operations', op) for op in ('Begin', 'Commit', 'Rollback')):
+            raise RuntimeError('El modo forzado requiere transacciones del servidor')
+        if 'model_operations' not in client.tools or not operation_supported(client, 'model_operations', 'ExportTMDL'):
+            raise RuntimeError('El modo forzado requiere respaldo TMDL del modelo')
     if getattr(client, 'active_transaction', None):
         raise RuntimeError('Hay una transaccion anterior pendiente de cierre; no se iniciara otro bloque')
     if not ensure_connected(client, allow_reconnect=True, allow_restart=True):
@@ -1911,6 +2015,18 @@ def _execute_ai_plan(client, plan):
             backup['connectionDiagnostics'] = list(getattr(client, 'connection_events', []))
             save_recovery_file(path, backup)
         else:
+            if backup.get('forceSnapshot'):
+                after = metadata_export(client)
+                backup['forceEffects'] = snapshot_differences(backup['forceSnapshot'], after)
+                print('Efectos del bloque forzado (incluye cambios solicitados y efectos de cascada):')
+                for effect in backup['forceEffects']:
+                    print('-', effect)
+                if after['errors']:
+                    print('AVISO: inspeccion final parcial; consulta el respaldo.')
+                for section in ('measures', 'columns'):
+                    for obj in after.get(section, []):
+                        if obj.get('errorMessage') or 'error' in str(obj.get('state', '')).casefold():
+                            print('AVISO: objeto invalido tras forzar:', obj.get('tableName'), obj.get('name'), obj.get('errorMessage', obj.get('state')))
             save_recovery_file(path, backup)
     client.last_block_status = 'fallido' if failed else 'completado'
     skipped = len(plan) - len(results)
@@ -1970,7 +2086,15 @@ def ai_block(client):
     if any(item['operation'] != 'Execute' for item in plan):
         print('Se creara un respaldo local antes de escribir. Si falla el bloque se intentara restaurar y verificar el estado anterior. No es una copia completa del PBIX/PBIP.')
     if any(item['operation'] == 'Delete' for item in plan):
-        print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
+        print('ATENCION: se eliminaran los objetos indicados. Cascada solo en operaciones con force: true.')
+    forced = [item for item in plan if item['instruction'].get('force')]
+    if forced:
+        print('FORZAR puede eliminar dependientes o dejar expresiones/visuales invalidos. No garantiza recuperar el informe completo.')
+        if input('Escribe CONFIRMAR FORZAR para autorizar la cascada de este bloque: ').strip() != 'CONFIRMAR FORZAR':
+            print('Bloque cancelado; no se envio ninguna escritura.')
+            return []
+        for item in forced:
+            item['forceAuthorized'] = True
     print('Ejecutando bloque validado' + ('; escritura autorizada por --write.' if client.writable else '; solo consultas de lectura.'))
     return execute_ai_plan(client, plan)
 
@@ -2063,6 +2187,7 @@ def main():
             print('11. Ejecutar consulta DAX')
             print('12. Herramienta avanzada')
             print('13. Ejecutar bloque de instrucciones de IA')
+            print('14. Exportar JSON completo: tablas, medidas y columnas calculadas')
             print('0. Salir')
             choice = input('Opcion: ').strip()
             if choice == '0':
@@ -2088,6 +2213,9 @@ def main():
                     advanced(client)
                 elif choice == '13':
                     ai_block(client)
+                elif choice == '14':
+                    if ensure_connected(client):
+                        print_metadata_export(client)
                 else:
                     print('Opcion invalida')
             except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
