@@ -685,7 +685,7 @@
 0|
 0|
 0|def get_object(client, tool, obj):
-4|rows = object_rows(request_call(client, tool, 'Get', references=[object_reference(obj, tool == 'table_operations')]), tool.split('_')[0] + 's')
+4|rows = object_rows(request_call(client, tool, 'Get', references=[object_reference(obj, tool in ('table_operations', 'relationship_operations'))]), tool.split('_')[0] + 's')
 4|if len(rows) != 1:
 8|raise RuntimeError('No se pudo identificar un unico objeto')
 4|return dict(obj, **rows[0])
@@ -720,6 +720,57 @@
 4|print('Filas:', len(rows), '(celdas en pantalla limitadas a 60 caracteres; CSV conserva el valor)')
 0|
 0|
+0|def metadata_export(client, section='all'):
+4|"""Keep every property returned by Get, including formatting and annotations."""
+4|result = {'schemaVersion': 1, 'model': client.model_name, 'complete': True,
+14|'warnings': ['Metadatos del modelo; no incluye datos de filas ni todos los usos en visuales/filtros del informe.'],
+14|'errors': []}
+4|mapping = {'tables': 'table_operations', 'measures': 'measure_operations',
+15|'columns': 'column_operations', 'relationships': 'relationship_operations'}
+4|sections = mapping if section == 'all' else {section: mapping[section]}
+4|for label, tool in sections.items():
+8|result[label] = []
+8|try:
+12|rows = list_objects(client, tool)
+12|if len(rows) >= 100000:
+16|raise RuntimeError('Inventario posiblemente truncado')
+12|for row in rows:
+16|try:
+20|if tool == 'relationship_operations':
+24|details = object_rows(request_call(client, tool, 'Get', references=[{'name': row['name']}]), 'relationships')
+24|if len(details) != 1:
+28|raise RuntimeError('No se pudo leer una relacion unica')
+24|detail = dict(row, **details[0])
+20|else:
+24|detail = get_object(client, tool, row)
+20|result[label].append(detail)
+16|except (RuntimeError, ValueError, TimeoutError, OSError, KeyError) as exc:
+20|result[label].append(dict(row, metadataIncomplete=True))
+20|result['errors'].append(f'{label}: {row.get("name")}: {exc}')
+8|except (RuntimeError, ValueError, TimeoutError, OSError, KeyError) as exc:
+12|result['errors'].append(f'{label}: {exc}')
+4|if 'columns' in result:
+8|result['calculatedColumns'] = [dict(col) for col in result['columns'] if calculated_column(col)]
+4|result['complete'] = not result['errors']
+4|return result
+0|
+0|
+0|def print_metadata_export(client, section='all'):
+4|data = metadata_export(client, section)
+4|folder = Path(getattr(client, 'export_dir', Path.cwd() / 'exports'))
+4|folder.mkdir(parents=True, exist_ok=True)
+4|path = folder / ('metadatos_' + section + '_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8] + '.json')
+4|text = json.dumps(data, indent=2, ensure_ascii=False)
+4|path.write_text(text, encoding='utf-8')
+4|print('\n========== JSON DE METADATOS ==========')
+4|print(text)
+4|print('========== FIN JSON ==========')
+4|print('Archivo UTF-8:', path.resolve())
+4|if not data['complete']:
+8|print('AVISO: exportacion parcial; consulta errors antes de usarla.')
+4|return data
+0|
+0|
 0|def simple_list(client, tool, title):
 4|if not ensure_connected(client):
 8|return
@@ -736,33 +787,28 @@
 4|show_objects(rows)
 4|if not rows:
 8|return
-4|if tool == 'measure_operations':
-8|while True:
-12|raw = input('Numero para ver DAX, /texto para filtrar nombre/tabla, Enter para regresar: ').strip()
-12|if not raw:
-16|return
-12|if raw.startswith('/'):
-16|text = raw[1:].casefold()
-16|filtered = [r for r in rows if text in (r.get('name', '') + ' ' + r.get('tableName', '')).casefold()]
-16|show_objects(filtered)
-16|if filtered:
-20|obj = choose(filtered, 'Selecciona medida (Enter=regresar): ')
-16|else:
-20|continue
-12|else:
-16|if not raw.isdigit() or not 1 <= int(raw) <= len(rows):
-20|print('Seleccion invalida')
-20|continue
-16|obj = rows[int(raw) - 1]
-12|if obj:
-16|show_details(get_object(client, tool, obj))
-4|elif operation_supported(client, tool, 'Get'):
-8|obj = choose(rows, 'Tabla para ver estructura (Enter=regresar): ')
+4|while True:
+8|section = 'measures' if tool == 'measure_operations' else 'all'
+8|raw = input('Numero para ver detalle, json=exportar JSON completo, /texto para filtrar, Enter para regresar: ').strip()
+8|if not raw:
+12|return
+8|if raw.casefold() == 'json':
+12|print_metadata_export(client, section)
+12|continue
+8|if raw.startswith('/'):
+12|text = raw[1:].casefold()
+12|filtered = [r for r in rows if text in (r.get('name', '') + ' ' + r.get('tableName', '')).casefold()]
+12|show_objects(filtered)
+12|obj = choose(filtered, 'Selecciona objeto (Enter=regresar): ') if filtered else None
+8|elif raw.isdigit() and 1 <= int(raw) <= len(rows):
+12|obj = rows[int(raw) - 1]
+8|else:
+12|print('Seleccion invalida')
+12|continue
 8|if obj:
 12|show_details(get_object(client, tool, obj))
-12|if 'column_operations' in client.tools:
-16|columns = [r for r in list_objects(client, 'column_operations') if r.get('tableName') == obj['name']]
-16|display_grid(columns)
+12|if tool == 'table_operations' and 'column_operations' in client.tools:
+16|display_grid([r for r in list_objects(client, 'column_operations') if r.get('tableName') == obj['name']])
 0|
 0|
 0|def show_details(obj):
@@ -1154,9 +1200,10 @@
 8|if not isinstance(op, dict):
 12|raise ValueError(f'Instruccion {index}: se requiere un objeto')
 8|if op.get('action') == 'delete_measures':
-12|if set(op) != {'action', 'table', 'names'} or not isinstance(op['names'], list) or not op['names']:
+12|if set(op) - {'action', 'table', 'names', 'force'} or not {'action', 'table', 'names'} <= op.keys() or not isinstance(op['names'], list) or not op['names']:
 16|raise ValueError(f'Instruccion {index}: delete_measures requiere table y names no vacio')
-12|expanded.extend({'action': 'delete_measure', 'table': op['table'], 'name': name} for name in op['names'])
+12|expanded.extend(dict(action='delete_measure', table=op['table'], name=name,
+33|**({'force': op['force']} if 'force' in op else {})) for name in op['names'])
 8|else:
 12|expanded.append(dict(op))
 4|for index, op in enumerate(expanded, 1):
@@ -1167,7 +1214,7 @@
 12|allowed, required = {'action', 'query', 'maxRows'}, {'action', 'query'}
 8|else:
 12|required = {'action', 'table', 'name'}
-12|allowed = required if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
+12|allowed = required | {'force'} if action.startswith('delete_') else required | AI_PROPERTIES | {'expression'}
 12|if action.startswith('create_'):
 16|required = required | {'expression'}
 8|if set(op) - allowed or required - set(op):
@@ -1183,6 +1230,8 @@
 12|raise ValueError(f'Operacion {index}: no hay propiedades para modificar')
 8|if 'maxRows' in op and (type(op['maxRows']) is not int or not 1 <= op['maxRows'] <= 100000):
 12|raise ValueError(f'Operacion {index}: maxRows debe estar entre 1 y 100000')
+8|if 'force' in op and type(op['force']) is not bool:
+12|raise ValueError(f'Operacion {index}: force debe ser true o false')
 4|return expanded
 0|
 0|
@@ -1315,17 +1364,22 @@
 16|if not calculated_column(current):
 20|raise ValueError(f'Operacion {index}: columna de origen o tipo no compatible')
 12|if operation == 'Delete':
+16|forced = op.get('force', False)
 16|if tool == 'column_operations' and any(
 24|(str(r.get(side + 'Table', '')).casefold(), str(r.get(side + 'Column', '')).casefold()) == key
 24|for r in relationships for side in ('from', 'to')):
-20|raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+20|if not forced:
+24|raise ValueError(f'Operacion {index}: la columna participa en una relacion existente')
+20|warnings.append(f'Operacion {index}: FORZADA; la columna participa en una relacion y la cascada puede eliminarla.')
 16|for other_tool, rows in inventory.items():
 20|for other_key, other in rows.items():
 24|if other_tool == tool and other_key == key:
 28|continue
 24|refs = dax_references(other.get('expression') or '')
 24|if any(name == key[1] and (table is None or table == key[0]) for table, name in refs):
-28|raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+28|if not forced:
+32|raise ValueError(f'Operacion {index}: posible dependencia de {other.get("tableName", "?")}[{other["name"]}]; modifica o elimina primero ese objeto')
+28|warnings.append(f'Operacion {index}: FORZADA; puede afectar {other.get("tableName", "?")}[{other["name"]}].')
 16|del objects[key]
 16|removed.add(key)
 12|else:
@@ -1346,6 +1400,8 @@
 20|objects[key]['columnType'] = 'Calculated'
 12|history.append(operation)
 12|fields = build_object_fields(client, tool, operation, ai_object(op))
+12|if operation == 'Delete' and op.get('force'):
+16|fields['shouldCascadeDelete'] = True
 8|root = tool_schema(client, tool)
 8|req = {'request': dict(operation=operation, connectionName=client.connection_name, **fields)}
 8|unknown = set(fields) - request_schema(client, tool).get('properties', {}).keys()
@@ -1440,6 +1496,10 @@
 16|refs = dax_references(change['instruction']['expression'])
 16|resolved = not any(name == key[2] and (table is None or table == key[1]) for table, name in refs)
 8|if not resolved:
+12|if plan[deletes[key]]['instruction'].get('force'):
+16|report['warnings'].append('FORZADA: dependencia del motor: ' + str(row.get('[TABLE]', '?')) +
+42|'[' + str(row.get('[OBJECT]', '?')) + ']. Puede eliminarse o quedar invalida.')
+16|continue
 12|raise ValueError('Dependencia detectada por el motor: ' + str(row.get('[TABLE]', '?')) +
 29|'[' + str(row.get('[OBJECT]', '?')) + '] utiliza el objeto que se intenta eliminar. Modifica o elimina primero el dependiente.')
 0|
@@ -1496,6 +1556,14 @@
 12|'plan': [item['instruction'] for item in plan],
 12|'scope': 'Estado de objetos del modelo; no es una copia completa del PBIX/PBIP ni del informe.'}
 4|seen = set()
+4|if any(item['instruction'].get('force') for item in plan):
+8|data['forceSnapshot'] = metadata_export(client)
+8|if not data['forceSnapshot']['complete']:
+12|raise RuntimeError('No se puede respaldar todo el alcance de la cascada: ' + '; '.join(data['forceSnapshot']['errors']))
+8|# TMDL also retains objects outside the basic tables/columns/measures scope.
+8|data['forceTmdl'] = request_call(client, 'model_operations', 'ExportTMDL',
+39|tmdlExportOptions={'serializationOptions': {'includeChildren': True},
+58|'maxReturnCharacters': -1})
 4|for item in plan:
 8|if item['operation'] == 'Execute':
 12|continue
@@ -1571,6 +1639,32 @@
 24|verify_column_storage(client, target['reference'])
 8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
 12|differences.append(target['reference']['name'] + ': no se pudo verificar: ' + str(exc))
+4|if backup.get('forceSnapshot'):
+8|current = metadata_export(client)
+8|differences.extend(snapshot_differences(backup['forceSnapshot'], current))
+8|try:
+12|tmdl = request_call(client, 'model_operations', 'ExportTMDL',
+31|tmdlExportOptions={'serializationOptions': {'includeChildren': True},
+50|'maxReturnCharacters': -1})
+12|if tmdl != backup.get('forceTmdl'):
+16|differences.append('El TMDL del modelo difiere del respaldo anterior a la cascada')
+8|except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+12|differences.append('No se pudo verificar el TMDL despues de la cascada: ' + str(exc))
+4|return differences
+0|
+0|
+0|def snapshot_differences(before, after):
+4|differences = list(after.get('errors', []))
+4|for section in ('tables', 'measures', 'columns', 'relationships'):
+8|def indexed(snapshot):
+12|return {(r.get('tableName', ''), r['name']):
+20|{'metadata': stable_state(r), 'errorMessage': r.get('errorMessage') or '',
+21|'semanticError': 'error' in str(r.get('state', '')).casefold()}
+20|for r in snapshot.get(section, [])}
+8|previous, current = indexed(before), indexed(after)
+8|for key in previous.keys() | current.keys():
+12|if previous.get(key) != current.get(key):
+16|differences.append(f'{section}: {key[0]}[{key[1]}]: metadatos distintos')
 4|return differences
 0|
 0|
@@ -1682,6 +1776,16 @@
 4|"""--write authorizes this validated block; never retry an uncertain write."""
 4|if any(item['operation'] != 'Execute' for item in plan) and not client.writable:
 8|raise RuntimeError('Modo solo lectura: el bloque contiene escrituras')
+4|forced = [item for item in plan if item['instruction'].get('force')]
+4|if forced:
+8|if not all(item.get('forceAuthorized') is True for item in forced):
+12|raise RuntimeError('Eliminacion forzada sin CONFIRMAR FORZAR; no se enviaron cambios')
+8|if any(item['operation'] == 'Execute' for item in plan):
+12|raise ValueError('Separa las consultas execute_dax del bloque forzado para conservar la transaccion global')
+8|if 'transaction_operations' not in client.tools or not all(operation_supported(client, 'transaction_operations', op) for op in ('Begin', 'Commit', 'Rollback')):
+12|raise RuntimeError('El modo forzado requiere transacciones del servidor')
+8|if 'model_operations' not in client.tools or not operation_supported(client, 'model_operations', 'ExportTMDL'):
+12|raise RuntimeError('El modo forzado requiere respaldo TMDL del modelo')
 4|if getattr(client, 'active_transaction', None):
 8|raise RuntimeError('Hay una transaccion anterior pendiente de cierre; no se iniciara otro bloque')
 4|if not ensure_connected(client, allow_reconnect=True, allow_restart=True):
@@ -1911,6 +2015,18 @@
 12|backup['connectionDiagnostics'] = list(getattr(client, 'connection_events', []))
 12|save_recovery_file(path, backup)
 8|else:
+12|if backup.get('forceSnapshot'):
+16|after = metadata_export(client)
+16|backup['forceEffects'] = snapshot_differences(backup['forceSnapshot'], after)
+16|print('Efectos del bloque forzado (incluye cambios solicitados y efectos de cascada):')
+16|for effect in backup['forceEffects']:
+20|print('-', effect)
+16|if after['errors']:
+20|print('AVISO: inspeccion final parcial; consulta el respaldo.')
+16|for section in ('measures', 'columns'):
+20|for obj in after.get(section, []):
+24|if obj.get('errorMessage') or 'error' in str(obj.get('state', '')).casefold():
+28|print('AVISO: objeto invalido tras forzar:', obj.get('tableName'), obj.get('name'), obj.get('errorMessage', obj.get('state')))
 12|save_recovery_file(path, backup)
 4|client.last_block_status = 'fallido' if failed else 'completado'
 4|skipped = len(plan) - len(results)
@@ -1970,7 +2086,15 @@
 4|if any(item['operation'] != 'Execute' for item in plan):
 8|print('Se creara un respaldo local antes de escribir. Si falla el bloque se intentara restaurar y verificar el estado anterior. No es una copia completa del PBIX/PBIP.')
 4|if any(item['operation'] == 'Delete' for item in plan):
-8|print('ATENCION: se eliminaran los objetos indicados. Pueden existir dependencias. Se desactiva la cascada.')
+8|print('ATENCION: se eliminaran los objetos indicados. Cascada solo en operaciones con force: true.')
+4|forced = [item for item in plan if item['instruction'].get('force')]
+4|if forced:
+8|print('FORZAR puede eliminar dependientes o dejar expresiones/visuales invalidos. No garantiza recuperar el informe completo.')
+8|if input('Escribe CONFIRMAR FORZAR para autorizar la cascada de este bloque: ').strip() != 'CONFIRMAR FORZAR':
+12|print('Bloque cancelado; no se envio ninguna escritura.')
+12|return []
+8|for item in forced:
+12|item['forceAuthorized'] = True
 4|print('Ejecutando bloque validado' + ('; escritura autorizada por --write.' if client.writable else '; solo consultas de lectura.'))
 4|return execute_ai_plan(client, plan)
 0|
@@ -2063,6 +2187,7 @@
 12|print('11. Ejecutar consulta DAX')
 12|print('12. Herramienta avanzada')
 12|print('13. Ejecutar bloque de instrucciones de IA')
+12|print('14. Exportar JSON completo: tablas, medidas y columnas calculadas')
 12|print('0. Salir')
 12|choice = input('Opcion: ').strip()
 12|if choice == '0':
@@ -2088,6 +2213,9 @@
 20|advanced(client)
 16|elif choice == '13':
 20|ai_block(client)
+16|elif choice == '14':
+20|if ensure_connected(client):
+24|print_metadata_export(client)
 16|else:
 20|print('Opcion invalida')
 12|except (ValueError, RuntimeError, TimeoutError, KeyError, TypeError, OSError) as exc:
