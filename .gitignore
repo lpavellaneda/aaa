@@ -1,4 +1,6 @@
 __pycache__/
-*.py[cod]
-resultado_*.json
+*.pyc
 backups/
+exports/
+resultado_*.json
+*.log
